@@ -379,13 +379,44 @@ rabbitmq:
 - Dev-only throwaway values are OK to commit, but never real passwords, cloud keys or tokens — bots scan GitHub, and history keeps them even after deletion.
 - Later: .NET **user-secrets** for connection strings, **Kubernetes Secrets** in the cluster.
 
-**Git**
+
+
+---
+
+## Step 11 — Contracts project (shared event records)
+
+**Project type: Class Library** — no `Program.cs`, can't run by itself, builds to a DLL that other projects reference.
+| Type | Template | Runs by itself? | Used for |
+|---|---|---|---|
+| Web API | `webapi` | yes (HTTP) | TransferApi |
+| xUnit | `xunit` | via `dotnet test` | test projects |
+| Class Library | `classlib` | no | Contracts |
+| Worker Service | `worker` | yes (background, no HTTP) | RiskWorker, NotificationWorker |
+
 ```powershell
-git init
-dotnet new gitignore     # ignores bin/, obj/, .vs/, *.user ...
-# + appended ".env" to .gitignore
-git status --short --ignored   # "!!" = ignored, "??" = untracked (will be committed)
+dotnet new classlib -n Contracts -o src/Contracts --framework net8.0
+dotnet sln money-transfer-microservices.slnx add src/Contracts/Contracts.csproj
+dotnet add src/TransferApi reference src/Contracts/Contracts.csproj
 ```
+
+**Events** (`namespace Contracts`, one file each)
+| Event | Published by | Consumed by | Fields |
+|---|---|---|---|
+| `TransferRequested` | TransferApi | RiskWorker | TransferId, FromAccount, ToAccount, Amount, Currency, RequestedAtUtc |
+| `TransferApproved` | RiskWorker | TransferApi, NotificationWorker | same details + ApprovedAtUtc |
+| `TransferRejected` | RiskWorker | TransferApi, NotificationWorker | same details + Reason + RejectedAtUtc |
+
+**Why a shared project**
+- Services share **no** code or databases — except the message shapes.
+- MassTransit identifies a message by **namespace + type name** (`Contracts:TransferRequested`). Same fields in a different namespace = never delivered. One shared project guarantees a match.
+- All services reference Contracts, never each other. In bigger companies it's often a NuGet package.
+
+**Design rules**
+- Records only: immutable, no logic, no packages (not even MassTransit), no reference to any service.
+- Past-tense names = facts that already happened (`ApproveTransfer` would be a *command*).
+- **Event-carried state transfer**: result events carry the transfer details, so NotificationWorker can write its message without reading TransferApi's DB or calling it.
+- Timestamps in UTC.
+- **Evolving events: only add fields, never rename/remove** — old messages may still sit in a queue, old service versions may still run.
 
 ---
 
@@ -397,8 +428,8 @@ git status --short --ignored   # "!!" = ignored, "??" = untracked (will be commi
 - [x] Unit tests for the `Transfer` entity rules (`tests/TransferApi.UnitTests`)
 - [x] Decide: TransferApi consumes `TransferApproved` / `TransferRejected` to update the status (no PUT endpoint)
 - [x] RabbitMQ in docker-compose, credentials in `.env`, `git init` + `.gitignore`
-- [ ] First commit + push to GitHub
-- [ ] `Contracts` project with the event records
+- [x] First commit + push to GitHub
+- [x] `Contracts` project with the event records
 - [ ] TransferApi publishes `TransferRequested` (MassTransit v8 + outbox)
 - [ ] RiskWorker
 - [ ] TransferApi consumers for approved/rejected
