@@ -515,6 +515,161 @@ public Task InitializeAsync() => Task.WhenAll(_postgres.StartAsync(), _rabbitMq.
 
 ---
 
+## Step 14 — RiskWorker: consumer and risk rule
+
+**Project**: `src/RiskWorker` — **Worker Service** (`dotnet new worker --framework net8.0`), references Contracts, `MassTransit.RabbitMQ` 8.4.1 (same version as TransferApi). No database (stateless), no HTTP.
+```powershell
+dotnet new worker -n RiskWorker -o src/RiskWorker --framework net8.0
+dotnet sln money-transfer-microservices.slnx add src/RiskWorker/RiskWorker.csproj
+dotnet add src/RiskWorker reference src/Contracts/Contracts.csproj
+dotnet add src/RiskWorker package MassTransit.RabbitMQ --version 8.4.1
+```
+
+**Why `Worker.cs` was deleted**
+- The template's `Worker` is a `BackgroundService` with a `while` loop — for jobs *I* drive (timers, polling).
+- MassTransit already runs its own background service that connects to RabbitMQ, reads, acks, retries and reconnects. I only write **what to do with one message** → a **consumer** ("a controller for messages").
+
+**Files**
+| File | Role |
+|---|---|
+| `Services/IServices/IRiskEvaluator.cs` | Interface + `RiskDecision(IsApproved, Reason)` record with `Approve()` / `Reject(reason)` |
+| `Services/RiskEvaluator.cs` | The rule: `Amount > 10,000` → reject "Amount exceeds the limit of 10,000."; otherwise approve (10,000 itself is approved). No MassTransit code → easy to unit test |
+| `Consumers/TransferRequestedConsumer.cs` | `IConsumer<TransferRequested>`: read message → evaluate → `context.Publish(TransferApproved / TransferRejected)` → log |
+
+**`context.Message`** = the same `TransferRequested` TransferService published — same **data**, new **object**.
+Separate processes can't share objects; only JSON travels: serialize (TransferApi) → `outbox_message.body` → RabbitMQ → deserialize (RiskWorker).
+Both sides need the exact same Contracts type (`urn:message:Contracts:TransferRequested`).
+
+**Creating vs publishing**: `new TransferApproved(...)` only builds an object in memory. `context.Publish(...)` sends it as a message to the `Contracts:TransferApproved` exchange.
+
+**Consuming doesn't replace the message** — two separate messages:
+- `TransferRequested` (own MessageId) is **consumed**, then **acked** → RabbitMQ deletes it.
+- `TransferApproved` is a **new** message (own MessageId) in a different exchange, linked by `InitiatorId` / `ConversationId`.
+- Analogy: read a letter, post a reply, throw the original away.
+
+### `_publishEndpoint.Publish` (TransferService) vs `context.Publish` (consumer)
+| | TransferService | TransferRequestedConsumer |
+|---|---|---|
+| Called on | injected `IPublishEndpoint` | `ConsumeContext` of the incoming message |
+| Triggered by | HTTP request | incoming message |
+| Goes first to | `outbox_message` (same DB transaction) | RabbitMQ — held until `Consume` succeeds (in-memory outbox) |
+| Protects against | dual write | duplicate publishes on retry |
+| `ConversationId` | **new** | **copied** from incoming message |
+| `InitiatorId` | — | incoming message's MessageId |
+
+### Message ids — created by MassTransit, not by me
+| Id | Set by | When |
+|---|---|---|
+| `MessageId` | MassTransit | new for every message |
+| `ConversationId` | MassTransit | new outside a consumer; copied by `context.Publish` |
+| `InitiatorId` | MassTransit | id of the message that caused this one |
+- They live in the message **headers** (envelope), not in my records.
+- `TransferId` is **my business id** (in the body) — my code uses it to find the transfer. `ConversationId` is free tracing: filter logs by it to follow one transfer across all services.
+- Can be set manually (`Publish(msg, ctx => ctx.ConversationId = id)`) but rarely needed.
+
+### When is `TransferRequested` removed? — twice
+```
+TransferApi
+ ① SaveChanges → outbox_message row
+ ② delivery service sends it to RabbitMQ
+ ③ RabbitMQ confirms
+ ④ TransferApi DELETES the outbox_message row            ← removal #1 (Postgres)
+RabbitMQ
+ ⑤ exchange routes it into queue transfer-requested
+RiskWorker
+ ⑥ delivered to RiskWorker ("unacked": still in queue, hidden from others)
+ ⑦ Consume() → evaluate → context.Publish(TransferApproved) — HELD by in-memory outbox
+ ⑧ Consume() returns without exception
+ ⑨ MassTransit sends the held TransferApproved
+ ⑩ MassTransit sends "ack" for TransferRequested
+ ⑪ RabbitMQ DELETES it from the queue                    ← removal #2 (RabbitMQ)
+```
+| Situation | What happens to `TransferRequested` |
+|---|---|
+| `Consume` throws | no ack → retry → after last retry moved to `transfer-requested_error` |
+| crash during `Consume` | no ack, connection drops → redelivered |
+| crash between ⑨ and ⑩ | redelivered → processed again → **`TransferApproved` published twice** → receivers must be idempotent |
+- I never write delete code: the ack is automatic when `Consume` returns normally.
+- **In-memory outbox** decides the order: without it, `TransferApproved` is sent at ⑦, and every retry of a failing `Consume` sends it again.
+
+### `Program.cs` (RiskWorker)
+```csharp
+builder.Services.AddScoped<IRiskEvaluator, RiskEvaluator>();
+
+builder.Services.AddMassTransit(x =>
+{
+    x.SetKebabCaseEndpointNameFormatter();          // TransferRequestedConsumer -> queue "transfer-requested"
+    x.AddConsumer<TransferRequestedConsumer>();
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        cfg.Host(new Uri(builder.Configuration.GetConnectionString("RabbitMq")!));
+        cfg.UseMessageRetry(r => r.Interval(3, TimeSpan.FromSeconds(5)));  // then -> transfer-requested_error
+        cfg.UseInMemoryOutbox(context);             // publish only after Consume succeeds
+        cfg.ConfigureEndpoints(context);            // create queue + bindings per consumer
+    });
+});
+```
+- `appsettings.Development.json`: `ConnectionStrings:RabbitMq` = `amqp://transfer:transfer@localhost:5672`.
+- Order matters: retry wraps the outbox → each attempt gets a fresh outbox; only the successful attempt publishes.
+
+**RabbitMQ topology MassTransit created**
+```
+exchange Contracts:TransferRequested ──► exchange transfer-requested ──► queue transfer-requested ──► RiskWorker
+exchange Contracts:TransferApproved   (no queue yet → dropped)
+exchange Contracts:TransferRejected   (no queue yet → dropped)
+```
+- MassTransit binds the message-type exchange to an exchange with the queue's name, which then feeds the queue (exchange-to-exchange binding).
+- The queue is **durable**: it stays after RiskWorker stops, and collects messages until RiskWorker starts again.
+
+**Verified manually**: POST 50.00 → "Transfer … approved"; POST 20,000.00 → "Transfer … rejected: Amount exceeds the limit of 10,000."; `transfer-requested` queue: 0 messages left.
+
+---
+
+## Step 15 — RiskWorker unit tests + seeing messages in the RabbitMQ UI
+
+**Project**: `tests/RiskWorker.UnitTests` (xUnit, reference to RiskWorker). **No new packages** — the test harness is part of MassTransit.
+
+**Tests (4)**
+| Test | Checks |
+|---|---|
+| `Evaluate_AmountAtLimit_Approves` | 10,000.00 → approved, no reason (boundary: rule is `>`) |
+| `Evaluate_AmountAboveLimit_RejectsWithReason` | 10,000.01 → rejected, exact reason text |
+| `Consume_AmountWithinLimit_PublishesTransferApproved` | harness: consumed, `TransferApproved` published for the same TransferId, no `TransferRejected` |
+| `Consume_AmountAboveLimit_PublishesTransferRejectedWithReason` | harness: `TransferRejected` with the reason, no `TransferApproved` |
+
+**MassTransit test harness**
+```csharp
+_provider = new ServiceCollection()
+    .AddLogging()                                   // the consumer needs ILogger<T>
+    .AddScoped<IRiskEvaluator, RiskEvaluator>()
+    .AddMassTransitTestHarness(x => x.AddConsumer<TransferRequestedConsumer>())
+    .BuildServiceProvider(true);
+_harness = _provider.GetRequiredService<ITestHarness>();
+await _harness.Start();
+
+await _harness.Bus.Publish(message);
+Assert.True(await _harness.Published.Any<TransferApproved>(x => x.Context.Message.TransferId == message.TransferId));
+```
+- **In-memory bus** instead of RabbitMQ: no Docker, fast. Records everything consumed and published.
+- Right tool for **consumer** tests (decision + what gets published). The TransferApi integration test uses real RabbitMQ because there the point was to test the outbox → RabbitMQ chain.
+- `Any<T>()` **waits** until the message appears (or a timeout); `Select<T>()` only reads what's **already** recorded → always `await Any<T>()` before `Select<T>()`, or the test can be **flaky**.
+- Boundary testing: test exactly **at** the limit and **just above** it — that's where `>` vs `>=` bugs hide.
+
+**Seeing messages in the RabbitMQ UI (vs Azure Service Bus)**
+| Want to see | Service Bus | RabbitMQ UI (`localhost:15672`) |
+|---|---|---|
+| waiting messages | Active message count | Queues → **Ready** |
+| being processed | locked | **Unacked** |
+| look inside | Explorer → Peek | queue → **Get messages** with Ack mode **"Nack message requeue true"** (⚠️ "Ack … requeue false" deletes it) |
+| failed messages | dead-letter queue | **`<queue>_error`** (created by MassTransit on the first failure; headers `MT-Fault-Message`, `MT-Fault-StackTrace`) |
+| throughput | metrics | queue → **Message rates** (publish / deliver / ack) |
+- **Successful messages are not kept anywhere** — ack (RabbitMQ) / Complete (Service Bus) deletes them. Evidence of success = ack rate, consumer logs, the result (next message / DB status), tracing (OpenTelemetry, later).
+- `<queue>_skipped` = messages that arrived but no consumer in that queue handles their type.
+
+**Who created the RabbitMQ objects**: `transfer-requested` queue + exchange + binding → MassTransit at RiskWorker **startup** (`ConfigureEndpoints`), before any message. Result exchanges → MassTransit on first publish. (Only `Contracts:TransferRequested` was once created by hand during the outbox check — identical to what MassTransit creates.) Delete the queue in the UI → restart RiskWorker → it's back.
+
+---
+
 ## To do / open items
 - [x] Delete the old `money-transfer-microservices/` template folder
 - [x] Start Docker Desktop → `docker compose up -d` → apply the migration → check the table in psql
@@ -527,7 +682,8 @@ public Task InitializeAsync() => Task.WhenAll(_postgres.StartAsync(), _rabbitMq.
 - [x] `Contracts` project with the event records
 - [x] TransferApi publishes `TransferRequested` (MassTransit v8 + outbox)
 - [x] Integration tests: own RabbitMQ container instead of the dev one
-- [ ] RiskWorker
+- [x] RiskWorker (consumer + rule + Program.cs, verified manually)
+- [x] RiskWorker unit tests (evaluator + consumer with MassTransit test harness)
 - [ ] TransferApi consumers for approved/rejected
 - [ ] NotificationWorker
 - [ ] Publishing `TransferRequested` — look into the MassTransit **transactional outbox** (avoids the "dual write" problem: DB save succeeds but the message is lost)

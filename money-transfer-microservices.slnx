@@ -2,8 +2,10 @@
   <Folder Name="/src/">
     <Project Path="src/Contracts/Contracts.csproj" />
     <Project Path="src/TransferApi/TransferApi.csproj" />
+    <Project Path="src/RiskWorker/RiskWorker.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/RiskWorker.UnitTests/RiskWorker.UnitTests.csproj" />
     <Project Path="tests/TransferApi.IntegrationTests/TransferApi.IntegrationTests.csproj" />
     <Project Path="tests/TransferApi.UnitTests/TransferApi.UnitTests.csproj" />
   </Folder>
