@@ -420,6 +420,101 @@ dotnet add src/TransferApi reference src/Contracts/Contracts.csproj
 
 ---
 
+## Step 12 — Publishing `TransferRequested` with MassTransit + transactional outbox
+
+### The outbox pattern
+**Problem — "dual write"**: saving to Postgres and publishing to RabbitMQ are two systems with no shared transaction.
+- Save ✅ then publish 💥 → transfer stuck in `Pending` forever.
+- Publish ✅ then save 💥 → RiskWorker approves a transfer that doesn't exist.
+- try/catch can't fix it: a crash between the two lines runs no catch block.
+
+**Solution**: save the message **in the same DB transaction** as the transfer (`outbox_message` table). A background delivery service sends it to RabbitMQ later.
+| What fails | Transfer saved? | Message sent? |
+|---|---|---|
+| nothing | ✅ | ✅ shortly after |
+| DB save | ❌ | ❌ never |
+| RabbitMQ down | ✅ | ⏳ delayed, sent when it's back |
+| app crashes after commit | ✅ | ⏳ sent after restart |
+- RabbitMQ is **not involved** at save time → the API keeps accepting transfers even if RabbitMQ is down.
+- **At-least-once**, not exactly-once: the delivery service can send twice (crash after send, before marking sent) → **consumers must be idempotent**. MassTransit's **inbox** (`inbox_state`) skips already-processed message ids on the consumer side.
+
+### Three kinds of "retry"
+| | Where | Protects against | Gives up? |
+|---|---|---|---|
+| ① Outbox delivery | publisher (TransferApi) | broker unavailable when sending | no — waits until it can send |
+| ② Redelivery | broker | consumer crashed before ack | no — unacked messages are kept |
+| ③ Consumer retry | consumer (MassTransit) | temporary errors while processing | yes → `<queue>_error` |
+
+**Azure Service Bus comparison**: SDK send retry ≠ outbox (it gives up and throws → same dual-write problem).
+Redelivery = **peek-lock** + lock expiry (vs RabbitMQ ack). Poison messages: `MaxDeliveryCount` → built-in **DLQ** (RabbitMQ: DLX or MassTransit `_error` queue).
+ASB has **duplicate detection** by MessageId, but consumers still need to be idempotent.
+
+### Implementation
+**Packages** — `MassTransit.RabbitMQ` + `MassTransit.EntityFrameworkCore` **8.4.1**
+- ⚠️ MassTransit 8.5.x requires **EF Core 9** (NU1107 conflict with EFCore.NamingConventions 8.x). 8.4.1 = last version supporting EF Core 8.
+- Both MassTransit packages must always have the same version. Never v9 (commercial licence).
+
+**`Program.cs`**
+```csharp
+builder.Services.AddMassTransit(x =>
+{
+    x.AddEntityFrameworkOutbox<TransferDbContext>(o =>
+    {
+        o.UsePostgres();     // Postgres-specific locking SQL for the delivery service
+        o.UseBusOutbox();    // Publish() from controllers/services goes through the outbox
+    });
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        cfg.Host(new Uri(builder.Configuration.GetConnectionString("RabbitMq")!));
+        cfg.ConfigureEndpoints(context);
+    });
+});
+```
+**`appsettings.Development.json`**: `"RabbitMq": "amqp://transfer:transfer@localhost:5672"`
+
+**`TransferDbContext.OnModelCreating`**: `AddInboxStateEntity()`, `AddOutboxMessageEntity()`, `AddOutboxStateEntity()`
+→ migration `AddMassTransitOutbox` creates `inbox_state`, `outbox_message`, `outbox_state`.
+
+**`TransferService.CreateAsync`**: inject `IPublishEndpoint`; call `Publish(new TransferRequested(...))` **before** `SaveChangesAsync()` — with the outbox, Publish only adds the message to the DbContext; SaveChanges commits both.
+
+### Verified manually
+- POST → 201 → message `urn:message:Contracts:TransferRequested` arrived in RabbitMQ with the right fields.
+- `outbox_message` count = 0 afterwards (delivered, then cleaned up).
+- MassTransit creates an exchange named after the message type: **`Contracts:TransferRequested`** (fanout).
+- No consumer yet → RabbitMQ **drops** messages sent to an exchange with no bound queue. For the check I bound a temporary queue, then deleted it.
+
+**Gotcha**: `dotnet ef migrations add ... --no-build` then `dotnet run --no-build` → the new migration isn't compiled into the DLL → table missing → 500. Build after adding a migration.
+
+---
+
+## Step 13 — Integration tests get their own RabbitMQ container
+
+**Problem**: after adding MassTransit, the tests still published to the **dev** RabbitMQ (`localhost:5672` from `appsettings.Development.json`) — test messages mixed with dev traffic, and tests failed on machines without RabbitMQ running.
+
+**Fix**: `Testcontainers.RabbitMq` 4.16.0, same pattern as Postgres:
+```csharp
+private readonly RabbitMqContainer _rabbitMq = new RabbitMqBuilder("rabbitmq:4.1").Build();
+
+builder.UseSetting("ConnectionStrings:RabbitMq", _rabbitMq.GetConnectionString()); // amqp://guest:guest@127.0.0.1:<random port>/
+
+public Task InitializeAsync() => Task.WhenAll(_postgres.StartAsync(), _rabbitMq.StartAsync()); // parallel start
+```
+- Dispose order: **API first** (`base.DisposeAsync()`), then the containers — so the API doesn't try to reach containers that are already gone.
+- Using a connection string (`amqp://user:pass@host:port`) for RabbitMQ made this a one-line override.
+
+**Verified**: stopped both dev containers (`docker stop rabbitmq transfer-db`) → all 9 tests still passed.
+
+**Learned about messages and RabbitMQ**
+- Lifecycle today: `outbox_message` (ms) → sent to exchange → **no queue bound → dropped**. Outbox empty = delivered, not "never saved".
+- Exchanges only forward; **queues** store. A consumer's queue is created by MassTransit when the consumer service first starts — after that, messages wait there even while the consumer is stopped.
+- Transfers created before a consumer existed stay `Pending` forever → in production, **deploy consumers before publishers**.
+- The retrying (outbox delivery) is done by **TransferApi**, not RabbitMQ. RabbitMQ never reads my database. If TransferApi is down, rows simply wait.
+- RabbitMQ management statistics (`message_stats.publish_in`) are **in memory, sampled, reset on restart** — a count, not who/what. Don't treat them as exact.
+- psql: SQL needs `;`; double quotes = names, single quotes = values. `"SELECT ..."` is a syntax error.
+- Ports: `5199` was just a port I chose with `dotnet run --urls`; normal dev ports are in `launchSettings.json` (http 5243 / https 7032). TransferApi runs on Windows, the infrastructure in Docker, connected via `localhost` + published ports.
+
+---
+
 ## To do / open items
 - [x] Delete the old `money-transfer-microservices/` template folder
 - [x] Start Docker Desktop → `docker compose up -d` → apply the migration → check the table in psql
@@ -430,7 +525,8 @@ dotnet add src/TransferApi reference src/Contracts/Contracts.csproj
 - [x] RabbitMQ in docker-compose, credentials in `.env`, `git init` + `.gitignore`
 - [x] First commit + push to GitHub
 - [x] `Contracts` project with the event records
-- [ ] TransferApi publishes `TransferRequested` (MassTransit v8 + outbox)
+- [x] TransferApi publishes `TransferRequested` (MassTransit v8 + outbox)
+- [x] Integration tests: own RabbitMQ container instead of the dev one
 - [ ] RiskWorker
 - [ ] TransferApi consumers for approved/rejected
 - [ ] NotificationWorker

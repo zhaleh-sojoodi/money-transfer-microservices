@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using MassTransit;
 using Microsoft.EntityFrameworkCore;
 using TransferApi.Data;
 using TransferApi.Repositories;
@@ -16,6 +17,21 @@ builder.Services.AddDbContext<TransferDbContext>(options =>
 
 builder.Services.AddScoped<ITransferRepository, TransferRepository>();
 builder.Services.AddScoped<ITransferService, TransferService>();
+
+builder.Services.AddMassTransit(x =>
+{
+    x.AddEntityFrameworkOutbox<TransferDbContext>(o =>
+    {
+        o.UsePostgres();
+        o.UseBusOutbox();
+    });
+
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        cfg.Host(new Uri(builder.Configuration.GetConnectionString("RabbitMq")!));
+        cfg.ConfigureEndpoints(context);
+    });
+});
 
 builder.Services.AddControllers()
     .AddJsonOptions(options =>

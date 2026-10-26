@@ -1,3 +1,4 @@
+using MassTransit;
 using Microsoft.EntityFrameworkCore;
 using TransferApi.Domain.Entities;
 
@@ -13,5 +14,10 @@ public class TransferDbContext : DbContext
     {
         // Picks up every IEntityTypeConfiguration<T> in this project (e.g. TransferConfiguration).
         modelBuilder.ApplyConfigurationsFromAssembly(typeof(TransferDbContext).Assembly);
+
+        // MassTransit outbox tables: messages are saved here in the same transaction as the transfer.
+        modelBuilder.AddInboxStateEntity();
+        modelBuilder.AddOutboxMessageEntity();
+        modelBuilder.AddOutboxStateEntity();
     }
 }

@@ -1,3 +1,5 @@
+using Contracts;
+using MassTransit;
 using TransferApi.Domain.Entities;
 using TransferApi.Domain.Requests;
 using TransferApi.Repositories.IRepositories;
@@ -8,11 +10,13 @@ namespace TransferApi.Services;
 public class TransferService : ITransferService
 {
     private readonly ITransferRepository _repository;
+    private readonly IPublishEndpoint _publishEndpoint;
     private readonly ILogger<TransferService> _logger;
 
-    public TransferService(ITransferRepository repository, ILogger<TransferService> logger)
+    public TransferService(ITransferRepository repository, IPublishEndpoint publishEndpoint, ILogger<TransferService> logger)
     {
         _repository = repository;
+        _publishEndpoint = publishEndpoint;
         _logger = logger;
     }
 
@@ -22,9 +26,18 @@ public class TransferService : ITransferService
         var transfer = new Transfer(request.FromAccount, request.ToAccount, request.Amount, request.Currency);
 
         await _repository.AddAsync(transfer, cancellationToken);
-        await _repository.SaveChangesAsync(cancellationToken);
 
-        // Later: publish TransferRequested here (via the MassTransit outbox).
+        // With the outbox, Publish does not send anything yet: it adds the message to the DbContext.
+        // It must come BEFORE SaveChangesAsync so the transfer and the message are committed together.
+        await _publishEndpoint.Publish(new TransferRequested(
+            transfer.Id,
+            transfer.FromAccount,
+            transfer.ToAccount,
+            transfer.Amount,
+            transfer.Currency,
+            transfer.CreatedAtUtc), cancellationToken);
+
+        await _repository.SaveChangesAsync(cancellationToken);
 
         _logger.LogInformation("Transfer {TransferId} created with status {Status}", transfer.Id, transfer.Status);
 
