@@ -757,6 +757,199 @@ Total: **21 tests** (TransferApi 8 unit + 9 integration, RiskWorker 4 unit).
 
 ---
 
+## Design discussion — NotificationWorker and email (decided: keep it simple for now)
+
+**Why a Worker**: no HTTP API; it only listens to RabbitMQ and writes to its own database.
+**What it does in this project**: builds the notification text and **stores** it (CLAUDE.md). It does **not** send email — that would be a later feature.
+
+**Services are independent**: each has its own queue (prefix), process and database. SendGrid down, or NotificationWorker completely down, never stops TransferApi from updating the status — messages just wait in NotificationWorker's queue.
+
+**If email (SendGrid) is added later — don't call it inside the consumer**
+- Save to DB + call SendGrid in one `Consume` = **dual write** again: SendGrid down → retries → error queue → email never sent; crash after sending → redelivery → email sent twice.
+- Better: consumer saves the notification as `Pending` (DB only) → a `BackgroundService` in the same worker sends Pending rows → `Sent` / retry / `Failed`. (Outbox idea applied to email.) Extra columns: `status`, `sent_at_utc`, `attempts`.
+- `IEmailSender` abstraction (fake in tests, **Mailpit** container locally, SendGrid in prod). API key in **user-secrets** / Kubernetes **Secret**, never in git.
+- Events only carry account numbers → a real system needs the customer's email (in the event or NotificationWorker's own data) — never by reading another service's DB.
+
+**Alternative design to revisit with SendGrid / real money movement (e.g. Stripe)**
+- TransferApi consumes `TransferApproved`/`TransferRejected`, updates the status **and publishes `TransferStatusChanged` in the same transaction** (like `CreateAsync`). NotificationWorker consumes **that** instead of RiskWorker's events.
+- Benefit: the customer is only notified once the transfer record is really updated (TransferApi = source of truth); no notification if the update fails.
+- ⚠️ Inside a **consumer**, the injected `IPublishEndpoint` is the consume context — `UseBusOutbox()` does **not** apply → Publish would go straight to RabbitMQ (dual write). Needs the EF outbox on consumer endpoints:
+  ```csharp
+  x.AddConfigureEndpointsCallback((context, name, cfg) => cfg.UseEntityFrameworkOutbox<TransferDbContext>(context));
+  ```
+  (also enables the **inbox** → duplicate messages skipped before the consumer runs).
+- Risk *decides*; a separate payment step *executes* money movement; notify only after the final status is committed.
+
+---
+
+## Step 17 — NotificationWorker: project + its own database container
+
+**Project**: `src/NotificationWorker` (Worker Service, net8.0), reference to Contracts, `MassTransit.RabbitMQ` 8.4.1. Template `Worker.cs` deleted + `AddHostedService<Worker>()` removed.
+
+**Second Postgres container** (`docker-compose.yml`)
+```yaml
+notification-db:
+  image: postgres:16
+  container_name: notification-db
+  environment:
+    POSTGRES_DB: ${NOTIFICATION_DB_NAME:?...}
+    POSTGRES_USER: ${NOTIFICATION_DB_USER:?...}
+    POSTGRES_PASSWORD: ${NOTIFICATION_DB_PASSWORD:?...}
+  ports:
+    - "5433:5432"     # host 5433 → container 5432
+  volumes:
+    - notification-db-data:/var/lib/postgresql/data
+```
+- **Port mapping `host:container`**: inside, every Postgres listens on 5432. On my PC only one thing can use 5432 (`transfer-db`), so this one is published on **5433**. Connection string: `Host=localhost;Port=5433`.
+- **Separate server, not just a separate database** → TransferApi physically can't reach NotificationWorker's data ("never share databases").
+- New values in `.env` (`NOTIFICATION_DB_NAME/USER/PASSWORD`) and names in `.env.example`.
+- `docker compose up -d` only created the new container + volume; existing containers untouched.
+- `pg_isready` = quick "is Postgres accepting connections?" check.
+- GUI tools: same as before but **port 5433**, database `notification_db`, user `notification`.
+
+**Duplicates decision: A — unique index on `transfer_id` + check before insert** (database-level idempotency; works with any broker).
+
+**Docker basics**
+- `docker …` = one container by name (`docker stop rabbitmq`, `docker exec -it …`, `docker logs …`). `docker compose …` = everything in `docker-compose.yml` (run from its folder).
+- `docker compose up -d` (create/start what's missing or changed), `ps`, `logs -f <svc>`, `stop`/`start`, `down` (removes containers, **keeps volumes**), ⚠️ `down -v` (**deletes data**), `config` (check file with `.env` filled in).
+- **Image** = read-only template (like a class); **container** = running instance (like an object). 3 containers, 2 images: `transfer-db` and `notification-db` both from `postgres:16`, but with their own settings, ports and volumes → two independent servers.
+
+**EF Core in a worker**
+- Packages (same versions as TransferApi, because MassTransit 8.4.1 = EF Core 8): `Npgsql.EntityFrameworkCore.PostgreSQL` 8.0.11, `EFCore.NamingConventions` 8.0.3, `Microsoft.EntityFrameworkCore.Design` 8.0.11. `dotnet-ef` is already a local tool for the whole repo.
+- `Data/NotificationDbContext.cs`, `Data/Configurations/NotificationConfiguration.cs` — same structure as TransferApi.
+- **Unique index**: `builder.HasIndex(n => n.TransferId).IsUnique();` → `ix_notifications_transfer_id UNIQUE` → the database rejects a second notification for the same transfer.
+- `appsettings.Development.json`: `ConnectionStrings:NotificationDb` with **`Port=5433`**.
+- `Program.cs` (worker version — no `app.Environment`):
+  ```csharp
+  var host = builder.Build();
+  if (host.Services.GetRequiredService<IHostEnvironment>().IsDevelopment())
+  {
+      using var scope = host.Services.CreateScope();
+      scope.ServiceProvider.GetRequiredService<NotificationDbContext>().Database.Migrate();
+  }
+  host.Run();
+  ```
+- `dotnet ef` needs the DbContext **registered** in `Program.cs` to find it — the entity alone isn't enough.
+- Migration `InitialCreate` → table `notifications` (id, transfer_id, type varchar(20), recipient varchar(34), message varchar(500), created_at_utc timestamptz).
+
+## Step 18 — NotificationWorker: duplicate handling (check + unique index)
+
+**Inserting a row is not naturally idempotent** (unlike `Approve()`): a duplicate message would create a second notification → customer notified twice.
+
+**Two layers**
+1. **Check first** (the usual duplicate — redelivery after a crash):
+   ```csharp
+   var existing = await _notificationRepository.GetByTransferIdAsync(transferId, cancellationToken);
+   if (existing is not null)
+       return existing;
+   ```
+2. **Unique index as safety net** (the race — two copies processed at the same moment, both pass the check):
+   ```csharp
+   // NotificationRepository.TryAddAsync
+   try
+   {
+       await _dbContext.SaveChangesAsync(cancellationToken);
+       return true;
+   }
+   catch (DbUpdateException ex) when (ex.InnerException is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation })
+   {
+       _dbContext.Entry(notification).State = EntityState.Detached;
+       return false;   // the other copy already inserted it
+   }
+   ```
+```
+message ─► exists? ── yes ─► done (ack)
+             │ no
+             ▼
+          INSERT ── unique violation (race) ─► done (ack)
+             │ ok
+             ▼
+           done (ack)
+```
+- Every path ends in "done": a duplicate never causes retries, error-queue entries or a second row.
+- **Without using the check result**: the duplicate insert hits the unique index → exception → 3 retries → error queue → a normal duplicate looks like a failure.
+- `when (...)` = **exception filter**: only the duplicate-key error (Postgres SQLSTATE `23505`) is caught; any other DB error still throws → retry/error queue still work for real problems.
+- Lives in the **repository** because it's Postgres-specific — "translate an infrastructure error into a domain meaning" (a good reason for try/catch).
+- `Detached`: the rejected entity stays tracked in `Added` state otherwise, and a later `SaveChanges` on the same DbContext would try to insert it again.
+- `PostgresException` / `PostgresErrorCodes` → `using Npgsql;` (comes with the Npgsql EF provider).
+
+## Step 19 — NotificationWorker: consumers, MassTransit, full end-to-end
+
+**Consumers** (`Consumers/TransferApprovedConsumer.cs`, `TransferRejectedConsumer.cs`)
+- Names `<MessageName>Consumer` — the kebab formatter strips the `Consumer` suffix for the queue name (a typo like `Cosumer` → odd queue name). Same class names as in TransferApi are fine: different namespaces + different queue prefixes.
+- **Recipient = `FromAccount`** (the sender wants to know the outcome; events carry accounts, not emails).
+- **Message** built from the event (event-carried state transfer — no call to TransferApi):
+  - approved: `$"Your transfer of {Amount:0.00} {Currency} to {ToAccount} was approved."`
+  - rejected: `"... was rejected: {Reason}"`
+  - `{Amount:0.00}` = always two decimals.
+- Text is built in the consumers for now (option 1); could move to the service (`NotifyApprovedAsync`) to keep consumers thinner.
+
+**Don't catch the `Notification` constructor's `ArgumentException`**
+- Data comes from our own services → invalid data = a **bug** → let it throw → error queue (kept, visible, can be resent).
+- Catching and returning null → ack → message deleted → notification silently lost.
+- TransferApi controller is different: data from **users** → expected → catch → 400.
+
+**`Program.cs`**
+```csharp
+builder.Services.AddMassTransit(x =>
+{
+    x.SetEndpointNameFormatter(new KebabCaseEndpointNameFormatter("notification-worker", false));
+    x.AddConsumer<TransferApprovedConsumer>();
+    x.AddConsumer<TransferRejectedConsumer>();
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        cfg.Host(new Uri(builder.Configuration.GetConnectionString("RabbitMq")!));
+        cfg.UseMessageRetry(r =>
+        {
+            r.Interval(3, TimeSpan.FromSeconds(5));   // temporary problems
+            r.Ignore<ArgumentException>();            // permanent problems → straight to _error
+        });
+        cfg.ConfigureEndpoints(context);
+    });
+});
+```
+- Retry is for **temporary** problems (DB briefly down). **Permanent** ones (bad data) fail identically every time → `Ignore<T>()` skips retries.
+- `appsettings.Development.json`: `ConnectionStrings:RabbitMq` (same broker as the other services).
+
+**Verified end-to-end — all three services running**
+| POST | TransferApi | notification_db |
+|---|---|---|
+| 50.00 EUR from NL01… | `Approved` | `TransferApproved`, recipient NL01…, "Your transfer of 50.00 EUR to NL02BANK0002 was approved." |
+| 20,000.00 EUR from NL03… | `Rejected` | `TransferRejected`, recipient NL03…, "… was rejected: Amount exceeds the limit of 10,000." |
+
+RabbitMQ queues (all 0 messages, 1 consumer each):
+```
+transfer-requested                      → RiskWorker
+transfer-api-transfer-approved          → TransferApi
+transfer-api-transfer-rejected          → TransferApi
+notification-worker-transfer-approved   → NotificationWorker
+notification-worker-transfer-rejected   → NotificationWorker
+```
+→ one `TransferApproved` reached **both** TransferApi and NotificationWorker (publish once, react many).
+
+## Step 20 — NotificationWorker integration tests
+
+**Project**: `tests/NotificationWorker.IntegrationTests` (xUnit, reference to NotificationWorker, `Testcontainers.PostgreSql` 4.16.0). The MassTransit harness comes with MassTransit (via the project reference).
+
+**Setup = real Postgres + in-memory bus**
+- `PostgresFixture` (`IClassFixture`): starts `postgres:16`, applies the **real migrations** (`MigrateAsync`) → the unique index exists exactly as in production. `CreateDbContext()` for checking rows.
+- Each test class builds a `ServiceCollection` with the real DbContext / repository / service + `AddMassTransitTestHarness(x => x.AddConsumer<…>())`. Only RabbitMQ is replaced.
+- `await _harness.InactivityTask` = wait until the bus has finished processing everything, then check the database.
+- Tests share one database → each uses a **new `TransferId`**, so they don't see each other's rows.
+
+**Tests (4)**
+| Test | Checks |
+|---|---|
+| `TransferApproved_SavesApprovedNotification` | 1 row: type, recipient = FromAccount, exact text |
+| `TransferRejected_SavesNotificationWithReason` | text includes the reason |
+| `SameMessageTwice_SavesOnlyOneNotification` | publish twice → **1 row**, and **no consumer faulted** (`Consumed.Any(x => x.Exception != null)` is false) |
+| `TryAddAsync_SecondInsertForSameTransfer_ReturnsFalse` | two DbContexts = two copies; first `true`, second `false`, first row kept → unique-index safety net works on real Postgres |
+
+- The race test is run **sequentially** (first insert, then second) — deterministic, and it still hits the exact path a real race would: unique violation → caught → `false`. Real concurrency would make the test flaky.
+- The duplicate test checks **behaviour** (1 row, no error), not which layer stopped it — both the check and the unique index would pass it.
+
+Total: **25 tests** (TransferApi 8 unit + 9 integration, RiskWorker 4 unit, NotificationWorker 4 integration).
+
 ## To do / open items
 - [x] Delete the old `money-transfer-microservices/` template folder
 - [x] Start Docker Desktop → `docker compose up -d` → apply the migration → check the table in psql
@@ -777,6 +970,8 @@ Total: **21 tests** (TransferApi 8 unit + 9 integration, RiskWorker 4 unit).
   - [x] register consumers in `Program.cs` (queue-name prefix `transfer-api-…`, retry)
   - [x] manual end-to-end check
   - [x] entity unit tests for `Approve()` / `Reject()` + integration test for the consumers
-- [ ] NotificationWorker (own database `notification_db`, queues `notification-worker-…`)
+- [x] NotificationWorker (own database `notification_db`, queues `notification-worker-…`) — consumes `TransferApproved` / `TransferRejected` (original design), verified end-to-end
+- [x] NotificationWorker tests (Testcontainers Postgres + MassTransit harness; duplicate → 1 row; race → `TryAddAsync` false)
+- [ ] Later (optional): SendGrid via Pending/Sent + background sender; switch NotificationWorker to TransferApi's `TransferStatusChanged` (see design discussion)
 - [ ] NotificationWorker
 - [ ] Publishing `TransferRequested` — look into the MassTransit **transactional outbox** (avoids the "dual write" problem: DB save succeeds but the message is lost)

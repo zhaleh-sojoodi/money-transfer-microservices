@@ -10,6 +10,17 @@ services:
       - "5432:5432"
     volumes:
       - transfer-db-data:/var/lib/postgresql/data
+  notification-db:
+    image: postgres:16
+    container_name: notification-db
+    environment:
+      POSTGRES_DB: ${NOTIFICATION_DB_NAME:?Set NOTIFICATION_DB_NAME in .env}
+      POSTGRES_USER: ${NOTIFICATION_DB_USER:?Set NOTIFICATION_DB_USER in .env}
+      POSTGRES_PASSWORD: ${NOTIFICATION_DB_PASSWORD:?Set NOTIFICATION_DB_PASSWORD in .env}
+    ports:
+      - "5433:5432"   # 5433 on the host, because transfer-db already uses 5432
+    volumes:
+      - notification-db-data:/var/lib/postgresql/data
   rabbitmq:
     image: rabbitmq:4.1-management
     container_name: rabbitmq
@@ -25,4 +36,5 @@ services:
 
 volumes:
   transfer-db-data:
+  notification-db-data:
   rabbitmq-data:
