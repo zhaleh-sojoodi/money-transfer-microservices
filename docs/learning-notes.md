@@ -670,6 +670,93 @@ Assert.True(await _harness.Published.Any<TransferApproved>(x => x.Context.Messag
 
 ---
 
+## Step 16 — TransferApi updates the status
+
+**Design**: TransferApi **consumes** `TransferApproved` / `TransferRejected` (no PUT endpoint). Consumers live in `Consumers/`, next to `Controllers/` — two entry points: HTTP in, messages in.
+
+**Entity — state transitions**
+```csharp
+public void Approve()
+{
+    if (Status == TransferStatus.Approved) return;      // duplicate message → no-op (idempotent)
+    if (Status != TransferStatus.Pending)
+        throw new InvalidOperationException($"Cannot approve a transfer that is {Status}.");
+    Status = TransferStatus.Approved;
+    UpdatedAtUtc = DateTime.UtcNow;
+}
+```
+`Reject(reason)` works the same way and also sets `RejectionReason`. Setters stay private: these methods are the only way to change the status.
+
+**Service** — `ApproveAsync(Guid transferId, ...)` / `RejectAsync(Guid transferId, string reason, ...)`
+- Take the **id**, not a `Transfer`: the consumer has a `TransferApproved` *message*, which is a different type from the `Transfer` *entity*.
+- Not found → **throw**, don't return null:
+  ```csharp
+  var transfer = await _repository.GetByIdAsync(transferId, cancellationToken)
+      ?? throw new InvalidOperationException($"Transfer {transferId} not found.");
+  ```
+  In a consumer: throw → retry → `_error` queue (visible, message kept). Return/skip → ack → message deleted → update silently lost.
+  Same `null`, different meaning: controller GET → client asked for something missing → 404; consumer → our system is inconsistent → bug.
+- `??` = "if the left side is null, do the right side".
+
+**`async void` — never** (for async methods with no result use `Task`)
+- The caller can't await it, and exceptions aren't seen by the caller (can crash the process).
+- In a consumer, MassTransit would think `Consume` succeeded → ack → message deleted even if the work failed.
+- `Task` vs `Task<Transfer>`: both fine; return data only if a caller uses it.
+
+**Why consumers show "0 references"**: nothing in my code calls `Consume()` — MassTransit does (after `AddConsumer`). Same as controllers. CodeLens also stops counting calls that don't compile.
+**Hover/"no definition" broken everywhere** → editor issue: Ctrl+Shift+P → "C#: Restart Language Server" (or "Developer: Reload Window").
+
+**Migration `AddRejectionReason`**
+- `RejectionReason` is `string?` **before** generating the migration → column is `NULL`-able (pending/approved transfers have no reason). Non-nullable → `NOT NULL` column → every existing row would need a value.
+- `TransferConfiguration`: `builder.Property(t => t.RejectionReason).HasMaxLength(200);` → `character varying(200)` instead of unlimited `text`.
+- Generated: `AddColumn<string>("rejection_reason", "transfers", type: "character varying(200)", nullable: true)`; `Down()` drops the column.
+- Applied with `dotnet ef database update`; `\d transfers` shows `rejection_reason | character varying(200)`.
+
+**Registering the consumers (`Program.cs`, inside the existing `AddMassTransit`)**
+```csharp
+x.SetEndpointNameFormatter(new KebabCaseEndpointNameFormatter("transfer-api", false));
+x.AddConsumer<TransferApprovedConsumer>();
+x.AddConsumer<TransferRejectedConsumer>();
+...
+cfg.UseMessageRetry(r => r.Interval(3, TimeSpan.FromSeconds(5)));
+cfg.ConfigureEndpoints(context);
+```
+- `SetKebabCaseEndpointNameFormatter()` (RiskWorker) = the same formatter **without** a prefix. The long form takes a prefix.
+- Queue name comes from the consumer **class name**. Two services with a `TransferApprovedConsumer` and no prefix → **one shared queue** → RabbitMQ splits the messages, each service gets half ❌. With a prefix each service has its own queue and gets **every** message (= one subscription per service on a Service Bus topic).
+- Renaming a queue later: the old queue stays bound and keeps collecting copies forever → delete it in the UI.
+- No `UseInMemoryOutbox` here: these consumers don't publish anything; the entity methods are idempotent.
+
+**Verified end-to-end** (TransferApi + RiskWorker running)
+| POST | right after POST | GET a few seconds later |
+|---|---|---|
+| 50.00 EUR | `Pending` | `Approved`, `updatedAtUtc` changed |
+| 20,000.00 EUR | `Pending` | `Rejected`, reason "Amount exceeds the limit of 10,000." |
+
+Queues: `transfer-requested`, `transfer-api-transfer-approved`, `transfer-api-transfer-rejected` — all 0 messages, 1 consumer each.
+**Eventual consistency**: the POST answers `Pending` immediately; the final status appears a moment later, once the messages have gone round.
+
+**`context.CancellationToken`** in consumers = the controller's `CancellationToken`, but cancelled when the service **shuts down**. If cancelled before `SaveChangesAsync` completes → no ack → message stays in the queue → redelivered after restart. Safe because `Reject()`/`Approve()` are idempotent.
+
+**Tests added**
+| Test | Project | Checks |
+|---|---|---|
+| `Approve_PendingTransfer_SetsApproved` | UnitTests | Pending → Approved, no reason |
+| `Approve_AlreadyApproved_DoesNothing` | UnitTests | duplicate → same status, `UpdatedAtUtc` unchanged (idempotent) |
+| `Approve_RejectedTransfer_ThrowsInvalidOperationException` | UnitTests | invalid transition blocked, status stays Rejected |
+| `Reject_PendingTransfer_SetsRejectedWithReason` | UnitTests | Pending → Rejected + reason |
+| `Reject_EmptyReason_ThrowsArgumentException` | UnitTests | `ParamName == "reason"`, status stays Pending |
+| `TransferApproved_PendingTransfer_StatusBecomesApproved` | IntegrationTests | POST → publish `TransferApproved` → GET eventually `Approved` |
+| `TransferRejected_PendingTransfer_StatusBecomesRejectedWithReason` | IntegrationTests | POST → publish `TransferRejected` → GET eventually `Rejected` + reason |
+
+- The integration test **plays RiskWorker**: it publishes the result itself with `IBus.Publish` on the test RabbitMQ (no RiskWorker running in tests).
+- **Polling**: the status changes asynchronously, so the test GETs every 200 ms until it matches, failing after 10 s with the last status in the message. (Same idea as `Channel` + timeout in the publish test: never `Task.Delay(5000)` and hope.)
+- Also assert that a failed action **didn't change state** (status stays Pending/Rejected) — not just that it threw.
+- Separate test class → own `TransferApiFactory` (own containers). xUnit runs classes in parallel, so it costs little time.
+
+Total: **21 tests** (TransferApi 8 unit + 9 integration, RiskWorker 4 unit).
+
+---
+
 ## To do / open items
 - [x] Delete the old `money-transfer-microservices/` template folder
 - [x] Start Docker Desktop → `docker compose up -d` → apply the migration → check the table in psql
@@ -685,5 +772,11 @@ Assert.True(await _harness.Published.Any<TransferApproved>(x => x.Context.Messag
 - [x] RiskWorker (consumer + rule + Program.cs, verified manually)
 - [x] RiskWorker unit tests (evaluator + consumer with MassTransit test harness)
 - [ ] TransferApi consumers for approved/rejected
+  - [x] entity `Approve()` / `Reject()`, service methods, consumers written
+  - [x] `RejectionReason` column + migration
+  - [x] register consumers in `Program.cs` (queue-name prefix `transfer-api-…`, retry)
+  - [x] manual end-to-end check
+  - [x] entity unit tests for `Approve()` / `Reject()` + integration test for the consumers
+- [ ] NotificationWorker (own database `notification_db`, queues `notification-worker-…`)
 - [ ] NotificationWorker
 - [ ] Publishing `TransferRequested` — look into the MassTransit **transactional outbox** (avoids the "dual write" problem: DB save succeeds but the message is lost)

@@ -13,7 +13,8 @@ public class Transfer
     public DateTime CreatedAtUtc { get; private set; }
     public DateTime UpdatedAtUtc { get; private set; }
 
-    // Used by EF Core when loading rows from the database.
+    public string? RejectionReason {get; private set; } 
+
     private Transfer() { }
 
     public Transfer(string fromAccount, string toAccount, decimal amount, string currency)
@@ -39,5 +40,28 @@ public class Transfer
         Status = TransferStatus.Pending;
         CreatedAtUtc = DateTime.UtcNow;
         UpdatedAtUtc = CreatedAtUtc;
+    }
+
+    public void Approve()
+    {
+        if (Status == TransferStatus.Approved) return;
+        if (Status != TransferStatus.Pending)
+            throw new InvalidOperationException($"Cannot approve a transfer that is {Status}.");
+
+        Status = TransferStatus.Approved;
+        UpdatedAtUtc = DateTime.UtcNow;
+    }
+
+    public void Reject(string reason) 
+    {
+        if (Status == TransferStatus.Rejected) return;
+        if (Status != TransferStatus.Pending)
+            throw new InvalidOperationException($"Cannot reject a transfer that is {Status}.");
+        if (string.IsNullOrEmpty(reason))
+            throw new ArgumentException("Reason is required.", nameof(reason));
+
+        Status = TransferStatus.Rejected;
+        UpdatedAtUtc = DateTime.UtcNow;
+        RejectionReason  = reason;
     }
 }

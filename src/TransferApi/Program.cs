@@ -1,6 +1,7 @@
 using System.Text.Json.Serialization;
 using MassTransit;
 using Microsoft.EntityFrameworkCore;
+using TransferApi.Consumers;
 using TransferApi.Data;
 using TransferApi.Repositories;
 using TransferApi.Repositories.IRepositories;
@@ -20,6 +21,10 @@ builder.Services.AddScoped<ITransferService, TransferService>();
 
 builder.Services.AddMassTransit(x =>
 {
+    x.SetEndpointNameFormatter(new KebabCaseEndpointNameFormatter("transfer-api", false));
+    x.AddConsumer<TransferApprovedConsumer>();
+    x.AddConsumer<TransferRejectedConsumer>();
+
     x.AddEntityFrameworkOutbox<TransferDbContext>(o =>
     {
         o.UsePostgres();
@@ -29,6 +34,7 @@ builder.Services.AddMassTransit(x =>
     x.UsingRabbitMq((context, cfg) =>
     {
         cfg.Host(new Uri(builder.Configuration.GetConnectionString("RabbitMq")!));
+        cfg.UseMessageRetry(r => r.Interval(3, TimeSpan.FromSeconds(5)));
         cfg.ConfigureEndpoints(context);
     });
 });

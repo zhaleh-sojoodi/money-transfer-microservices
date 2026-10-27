@@ -268,6 +268,11 @@ namespace TransferApi.Data.Migrations
                         .HasColumnType("character varying(34)")
                         .HasColumnName("from_account");
 
+                    b.Property<string>("RejectionReason")
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)")
+                        .HasColumnName("rejection_reason");
+
                     b.Property<string>("Status")
                         .IsRequired()
                         .HasMaxLength(20)

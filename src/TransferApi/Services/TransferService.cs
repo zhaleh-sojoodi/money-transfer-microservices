@@ -44,6 +44,26 @@ public class TransferService : ITransferService
         return transfer;
     }
 
+    public async Task<Transfer> ApproveAsync(Guid transferId, CancellationToken cancellationToken = default) 
+    {
+        var transfer = await _repository.GetByIdAsync(transferId, cancellationToken)
+            ?? throw new InvalidOperationException($"Transfer {transferId} not found.");
+        transfer.Approve();
+
+        await _repository.SaveChangesAsync(cancellationToken);
+        return transfer;
+    }
+
+    public async Task<Transfer> RejectAsync(Guid transferId, string reason, CancellationToken cancellationToken = default) 
+    {
+        var transfer = await _repository.GetByIdAsync(transferId, cancellationToken)
+            ?? throw new InvalidOperationException($"Transfer {transferId} not found.");
+        transfer.Reject(reason);
+
+        await _repository.SaveChangesAsync(cancellationToken);
+        return transfer;   
+    }
+
     public Task<Transfer?> GetByIdAsync(Guid id, CancellationToken cancellationToken = default)
     {
         return _repository.GetByIdAsync(id, cancellationToken);

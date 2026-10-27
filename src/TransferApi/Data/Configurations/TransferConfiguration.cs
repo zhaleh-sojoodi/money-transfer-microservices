@@ -22,5 +22,8 @@ public class TransferConfiguration : IEntityTypeConfiguration<Transfer>
 
         // Store the enum as text ('Pending') instead of an int (0).
         builder.Property(t => t.Status).HasConversion<string>().HasMaxLength(20);
+
+        // Only set when the transfer is rejected, so the column allows NULL.
+        builder.Property(t => t.RejectionReason).HasMaxLength(200);
     }
 }
