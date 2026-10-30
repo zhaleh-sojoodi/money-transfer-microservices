@@ -757,7 +757,7 @@ Total: **21 tests** (TransferApi 8 unit + 9 integration, RiskWorker 4 unit).
 
 ---
 
-## Design discussion — NotificationWorker and email (decided: keep it simple for now)
+## Design discussion — NotificationWorker and email (updated later: `TransferStatusChanged` was chosen, see Step 21)
 
 **Why a Worker**: no HTTP API; it only listens to RabbitMQ and writes to its own database.
 **What it does in this project**: builds the notification text and **stores** it (CLAUDE.md). It does **not** send email — that would be a later feature.
@@ -950,10 +950,75 @@ notification-worker-transfer-rejected   → NotificationWorker
 
 Total: **25 tests** (TransferApi 8 unit + 9 integration, RiskWorker 4 unit, NotificationWorker 4 integration).
 
+## Step 21 — Design change: notify only after the status is saved
+
+**The problem in the original design**: RiskWorker's `TransferApproved` / `TransferRejected` go to TransferApi and NotificationWorker **at the same time**, so the notification doesn't depend on the status update.
+| Failure in TransferApi | What happens | Customer sees |
+|---|---|---|
+| Temporary (database down briefly) | Message retries or waits, status updates after recovery | "Approved" while the transfer shows `Pending` for a short time |
+| TransferApi stopped | Message waits in its queue | The same, but for longer |
+| Permanent (not found, invalid status change) | Message goes to the `_error` queue, status doesn't change until someone fixes it | "Approved" while the transfer stays wrong |
+
+The approval isn't lost, but the notification can be wrong. In a money system that isn't acceptable.
+
+**The new design**: TransferApi saves the status and publishes `TransferStatusChanged` in **one transaction**. NotificationWorker consumes only that event.
+```
+RiskWorker ──► TransferApproved / TransferRejected ──► TransferApi
+                                                          │ one transaction: new status + TransferStatusChanged
+                                                          ▼
+                                                 NotificationWorker ──► notification saved
+```
+If the status update fails, the transaction rolls back, no event exists, and no notification is created.
+
+**Plan**
+- [x] Contracts: add `TransferStatusChanged` (`Status` is a string, because Contracts can't reference TransferApi's enum)
+- [x] `TransferService`: publish it in `ApproveAsync` / `RejectAsync`, after the entity method and **before** `SaveChangesAsync`
+- [x] TransferApi `Program.cs`: outbox for consumers
+  ```csharp
+  x.AddConfigureEndpointsCallback((context, name, cfg) =>
+      cfg.UseEntityFrameworkOutbox<TransferDbContext>(context));
+  ```
+- [x] NotificationWorker: one `TransferStatusChangedConsumer` replaces the two old consumers; update `Program.cs`
+- [x] Tests: update NotificationWorker tests; add a TransferApi test that the event is published
+- [x] Run everything end-to-end
+- [x] RabbitMQ UI: delete `notification-worker-transfer-approved` and `notification-worker-transfer-rejected` (Queues and Streams → open the queue → Delete Queue)
+- [x] Update the NotificationWorker line in `CLAUDE.md`
+
+**End-to-end result** (all three services running against the dev containers)
+| Amount | Transfer status | Notification |
+|---|---|---|
+| 50.00 EUR | `Approved` | `Your transfer of 50.00 EUR to E2E-TO was approved.` |
+| 20,000.00 EUR | `Rejected`, with the reason | `Your transfer of 20000.00 EUR to E2E-TO was rejected: Amount exceeds the limit of 10,000.` |
+
+`outbox_message` was empty afterwards, and no service logged an error. Each old queue received 1 message during this run, which shows the "keeps collecting messages" warning below is real: nothing reads them, so these two messages are safe to lose when the queues are deleted.
+
+**Things to remember**
+- ⚠️ Inside a consumer, `UseBusOutbox()` does **not** apply. Without the callback above, the code compiles and seems to work, but `Publish` goes straight to RabbitMQ, outside the transaction (dual write).
+- A renamed or replaced queue stays bound to its exchange and keeps collecting messages forever → delete it by hand.
+- NotificationWorker's duplicate protection stays: a repeated `TransferStatusChanged` still gives one notification.
+- An unknown `Status` is a bug → throw `ArgumentException` → straight to the error queue.
+
+The new queue will be `notification-worker-transfer-status-changed`.
+
+**Tests added or changed**
+| Test | Project | Checks |
+|---|---|---|
+| `TransferApproved_PendingTransfer_PublishesTransferStatusChanged` | TransferApi | Event has status `Approved`, no reason, right details |
+| `TransferRejected_PendingTransfer_PublishesTransferStatusChangedWithReason` | TransferApi | Event has status `Rejected` and the reason |
+| `TransferApproved_PendingTransfer_RunsThroughConsumerOutbox` | TransferApi | A row in `inbox_state` proves the consumer ran inside the outbox |
+| `TransferApproved_RejectedTransfer_FailsAndPublishesNoStatusChange` | TransferApi | The original bug: a failed update gives a `Fault` and no `Approved` event |
+| `StatusApproved_…`, `StatusRejected_…`, `SameMessageTwice_…` | NotificationWorker | Same checks as before, now using `TransferStatusChanged` |
+| `UnknownStatus_FailsAndSavesNothing` | NotificationWorker | Unknown status fails and saves no notification |
+
+- **`Fault<T>`**: MassTransit publishes this after all retries fail, so a test can wait for "it really failed" instead of guessing a delay. It takes about 15 seconds here because of the 3 retries.
+- **Limit**: the failed-update test fails *before* `Publish` runs, so it doesn't prove rollback of an already-published event. The inbox test proves the outbox is active; rollback itself isn't tested separately.
+
+Total: **30 tests** (TransferApi 8 unit + 13 integration, RiskWorker 4 unit, NotificationWorker 5 integration).
+
 ## To do / open items
 - [x] Delete the old `money-transfer-microservices/` template folder
 - [x] Start Docker Desktop → `docker compose up -d` → apply the migration → check the table in psql
-- [ ] Use `TransferDbContext` in my controller endpoints (practice)
+- [x] Save transfers in the database from my endpoints (controller → `ITransferService` → repository → `TransferDbContext`)
 - [x] Integration tests (xUnit + Testcontainers)
 - [x] Unit tests for the `Transfer` entity rules (`tests/TransferApi.UnitTests`)
 - [x] Decide: TransferApi consumes `TransferApproved` / `TransferRejected` to update the status (no PUT endpoint)
@@ -964,7 +1029,7 @@ Total: **25 tests** (TransferApi 8 unit + 9 integration, RiskWorker 4 unit, Noti
 - [x] Integration tests: own RabbitMQ container instead of the dev one
 - [x] RiskWorker (consumer + rule + Program.cs, verified manually)
 - [x] RiskWorker unit tests (evaluator + consumer with MassTransit test harness)
-- [ ] TransferApi consumers for approved/rejected
+- [x] TransferApi consumers for approved/rejected
   - [x] entity `Approve()` / `Reject()`, service methods, consumers written
   - [x] `RejectionReason` column + migration
   - [x] register consumers in `Program.cs` (queue-name prefix `transfer-api-…`, retry)
@@ -972,6 +1037,6 @@ Total: **25 tests** (TransferApi 8 unit + 9 integration, RiskWorker 4 unit, Noti
   - [x] entity unit tests for `Approve()` / `Reject()` + integration test for the consumers
 - [x] NotificationWorker (own database `notification_db`, queues `notification-worker-…`) — consumes `TransferApproved` / `TransferRejected` (original design), verified end-to-end
 - [x] NotificationWorker tests (Testcontainers Postgres + MassTransit harness; duplicate → 1 row; race → `TryAddAsync` false)
-- [ ] Later (optional): SendGrid via Pending/Sent + background sender; switch NotificationWorker to TransferApi's `TransferStatusChanged` (see design discussion)
-- [ ] NotificationWorker
-- [ ] Publishing `TransferRequested` — look into the MassTransit **transactional outbox** (avoids the "dual write" problem: DB save succeeds but the message is lost)
+- [x] `TransferStatusChanged` design change, verified end-to-end (see Step 21)
+- [ ] Next: containerise the three services (Dockerfiles, docker-compose), then Kubernetes
+- [ ] Optional, only when adding email: SendGrid via Pending/Sent + background sender

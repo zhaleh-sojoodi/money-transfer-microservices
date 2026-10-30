@@ -33,11 +33,7 @@ public class NotificationConsumerTests : IClassFixture<PostgresFixture>, IAsyncL
             .AddDbContext<NotificationDbContext>(o => o.UseNpgsql(_db.ConnectionString).UseSnakeCaseNamingConvention())
             .AddScoped<INotificationRepository, NotificationRepository>()
             .AddScoped<INotificationServices, NotificationService>()
-            .AddMassTransitTestHarness(x =>
-            {
-                x.AddConsumer<TransferApprovedConsumer>();
-                x.AddConsumer<TransferRejectedConsumer>();
-            })
+            .AddMassTransitTestHarness(x => x.AddConsumer<TransferStatusChangedConsumer>())
             .BuildServiceProvider(true);
 
         _harness = _provider.GetRequiredService<ITestHarness>();
@@ -47,9 +43,9 @@ public class NotificationConsumerTests : IClassFixture<PostgresFixture>, IAsyncL
     public async Task DisposeAsync() => await _provider.DisposeAsync();
 
     [Fact]
-    public async Task TransferApproved_SavesApprovedNotification()
+    public async Task StatusApproved_SavesApprovedNotification()
     {
-        var message = new TransferApproved(Guid.NewGuid(), "NL01BANK0001", "NL02BANK0002", 50.00m, "EUR", DateTime.UtcNow);
+        var message = CreateMessage(50.00m, "Approved", null);
 
         await _harness.Bus.Publish(message);
         await _harness.InactivityTask; // wait until the bus has finished processing
@@ -62,10 +58,9 @@ public class NotificationConsumerTests : IClassFixture<PostgresFixture>, IAsyncL
     }
 
     [Fact]
-    public async Task TransferRejected_SavesNotificationWithReason()
+    public async Task StatusRejected_SavesNotificationWithReason()
     {
-        var message = new TransferRejected(Guid.NewGuid(), "NL01BANK0001", "NL02BANK0002", 20_000.00m, "EUR",
-            "Amount exceeds the limit of 10,000.", DateTime.UtcNow);
+        var message = CreateMessage(20_000.00m, "Rejected", "Amount exceeds the limit of 10,000.");
 
         await _harness.Bus.Publish(message);
         await _harness.InactivityTask;
@@ -81,7 +76,7 @@ public class NotificationConsumerTests : IClassFixture<PostgresFixture>, IAsyncL
     [Fact]
     public async Task SameMessageTwice_SavesOnlyOneNotification()
     {
-        var message = new TransferApproved(Guid.NewGuid(), "NL01BANK0001", "NL02BANK0002", 50.00m, "EUR", DateTime.UtcNow);
+        var message = CreateMessage(50.00m, "Approved", null);
 
         // At-least-once delivery: the same event can arrive twice.
         await _harness.Bus.Publish(message);
@@ -92,6 +87,24 @@ public class NotificationConsumerTests : IClassFixture<PostgresFixture>, IAsyncL
         Assert.Equal(1, await db.Notifications.CountAsync(n => n.TransferId == message.TransferId));
 
         // Both copies were handled successfully: a duplicate is "already done", not an error.
-        Assert.False(await _harness.Consumed.Any<TransferApproved>(x => x.Exception != null));
+        Assert.False(await _harness.Consumed.Any<TransferStatusChanged>(x => x.Exception != null));
     }
+
+    [Fact]
+    public async Task UnknownStatus_FailsAndSavesNothing()
+    {
+        var message = CreateMessage(50.00m, "Pending", null);
+
+        await _harness.Bus.Publish(message);
+        await _harness.InactivityTask;
+
+        Assert.True(await _harness.Consumed.Any<TransferStatusChanged>(
+            x => x.Context.Message.TransferId == message.TransferId && x.Exception != null));
+
+        await using var db = _db.CreateDbContext();
+        Assert.Equal(0, await db.Notifications.CountAsync(n => n.TransferId == message.TransferId));
+    }
+
+    private static TransferStatusChanged CreateMessage(decimal amount, string status, string? reason) =>
+        new(Guid.NewGuid(), "NL01BANK0001", "NL02BANK0002", amount, "EUR", status, reason, DateTime.UtcNow);
 }

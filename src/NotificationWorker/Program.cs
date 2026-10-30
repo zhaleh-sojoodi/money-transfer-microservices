@@ -20,8 +20,7 @@ builder.Services.AddMassTransit(x =>
 {
     x.SetEndpointNameFormatter(new KebabCaseEndpointNameFormatter("notification-worker", false));
 
-    x.AddConsumer<TransferApprovedConsumer>();
-    x.AddConsumer<TransferRejectedConsumer>();
+    x.AddConsumer<TransferStatusChangedConsumer>();
 
     x.UsingRabbitMq((context, cfg) =>
     {

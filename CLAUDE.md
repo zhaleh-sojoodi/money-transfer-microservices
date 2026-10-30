@@ -3,9 +3,9 @@
 Portfolio project: event-driven money transfer system.
 
 ## Architecture
-- TransferApi: ASP.NET Core Web API + PostgreSQL. Creates transfers, publishes TransferRequested.
+- TransferApi: ASP.NET Core Web API + PostgreSQL. Creates transfers, publishes TransferRequested. Consumes TransferApproved / TransferRejected, updates the status, publishes TransferStatusChanged.
 - RiskWorker: consumes TransferRequested, publishes TransferApproved / TransferRejected.
-- NotificationWorker: consumes result events, stores notifications in its own database.
+- NotificationWorker: consumes TransferStatusChanged, stores notifications in its own database.
 - Contracts: shared class library with event message records only.
 - Services communicate only through RabbitMQ. Never share databases between services.
 

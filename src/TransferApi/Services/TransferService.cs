@@ -50,6 +50,17 @@ public class TransferService : ITransferService
             ?? throw new InvalidOperationException($"Transfer {transferId} not found.");
         transfer.Approve();
 
+        await _publishEndpoint.Publish(new TransferStatusChanged(
+            transfer.Id,
+            transfer.FromAccount,
+            transfer.ToAccount,
+            transfer.Amount,
+            transfer.Currency,
+            transfer.Status.ToString(),
+            null, 
+            transfer.UpdatedAtUtc 
+        ), cancellationToken);
+
         await _repository.SaveChangesAsync(cancellationToken);
         return transfer;
     }
@@ -59,6 +70,18 @@ public class TransferService : ITransferService
         var transfer = await _repository.GetByIdAsync(transferId, cancellationToken)
             ?? throw new InvalidOperationException($"Transfer {transferId} not found.");
         transfer.Reject(reason);
+
+        await _publishEndpoint.Publish(new TransferStatusChanged(
+            transfer.Id,
+            transfer.FromAccount,
+            transfer.ToAccount,
+            transfer.Amount,
+            transfer.Currency,
+            transfer.Status.ToString(),
+            reason,
+            transfer.UpdatedAtUtc 
+        ), cancellationToken);
+
 
         await _repository.SaveChangesAsync(cancellationToken);
         return transfer;   

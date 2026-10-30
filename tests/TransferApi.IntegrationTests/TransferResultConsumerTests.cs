@@ -1,8 +1,12 @@
 using System.Net.Http.Json;
 using System.Text.Json;
+using System.Threading.Channels;
 using Contracts;
 using MassTransit;
+using MassTransit.EntityFrameworkCoreIntegration;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using TransferApi.Data;
 using TransferApi.Domain.Requests;
 
 namespace TransferApi.IntegrationTests;
@@ -43,6 +47,130 @@ public class TransferResultConsumerTests : IClassFixture<TransferApiFactory>
 
         var body = await WaitForStatusAsync(transfer.Id, "Rejected");
         Assert.Equal("Amount exceeds the limit of 10,000.", body.GetProperty("rejectionReason").GetString());
+    }
+
+    [Fact]
+    public async Task TransferApproved_PendingTransfer_PublishesTransferStatusChanged()
+    {
+        var changes = Channel.CreateUnbounded<TransferStatusChanged>();
+        var subscription = await SubscribeAsync(changes);
+        try
+        {
+            var transfer = await CreateTransferAsync();
+
+            await PublishAsync(new TransferApproved(
+                transfer.Id, transfer.FromAccount, transfer.ToAccount, transfer.Amount, transfer.Currency, DateTime.UtcNow));
+
+            var message = await WaitForMessageAsync(changes, m => m.TransferId == transfer.Id, seconds: 10);
+            Assert.Equal("Approved", message.Status);
+            Assert.Null(message.Reason);
+            Assert.Equal(transfer.FromAccount, message.FromAccount);
+            Assert.Equal(transfer.Amount, message.Amount);
+        }
+        finally
+        {
+            await subscription.StopAsync();
+        }
+    }
+
+    [Fact]
+    public async Task TransferRejected_PendingTransfer_PublishesTransferStatusChangedWithReason()
+    {
+        var changes = Channel.CreateUnbounded<TransferStatusChanged>();
+        var subscription = await SubscribeAsync(changes);
+        try
+        {
+            var transfer = await CreateTransferAsync();
+
+            await PublishAsync(new TransferRejected(
+                transfer.Id, transfer.FromAccount, transfer.ToAccount, transfer.Amount, transfer.Currency,
+                "Amount exceeds the limit of 10,000.", DateTime.UtcNow));
+
+            var message = await WaitForMessageAsync(changes, m => m.TransferId == transfer.Id, seconds: 10);
+            Assert.Equal("Rejected", message.Status);
+            Assert.Equal("Amount exceeds the limit of 10,000.", message.Reason);
+        }
+        finally
+        {
+            await subscription.StopAsync();
+        }
+    }
+
+    // inbox_state is only written by UseEntityFrameworkOutbox, so a row here proves the consumer
+    // ran inside the outbox transaction. Without that setting this code still compiles and appears to work.
+    [Fact]
+    public async Task TransferApproved_PendingTransfer_RunsThroughConsumerOutbox()
+    {
+        var transfer = await CreateTransferAsync();
+        var messageId = NewId.NextGuid();
+
+        await _factory.Services.GetRequiredService<IBus>().Publish(
+            new TransferApproved(transfer.Id, transfer.FromAccount, transfer.ToAccount, transfer.Amount, transfer.Currency, DateTime.UtcNow),
+            context => context.MessageId = messageId);
+
+        await WaitForStatusAsync(transfer.Id, "Approved");
+
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<TransferDbContext>();
+        Assert.True(await db.Set<InboxState>().AnyAsync(s => s.MessageId == messageId));
+    }
+
+    // The original design bug: a failed status update must not lead to a notification.
+    // Approving a Rejected transfer throws, so after all retries MassTransit publishes a Fault.
+    [Fact]
+    public async Task TransferApproved_RejectedTransfer_FailsAndPublishesNoStatusChange()
+    {
+        var changes = Channel.CreateUnbounded<TransferStatusChanged>();
+        var faults = Channel.CreateUnbounded<Fault<TransferApproved>>();
+        var changeSubscription = await SubscribeAsync(changes);
+        var faultSubscription = await SubscribeAsync(faults);
+        try
+        {
+            var transfer = await CreateTransferAsync();
+            await PublishAsync(new TransferRejected(
+                transfer.Id, transfer.FromAccount, transfer.ToAccount, transfer.Amount, transfer.Currency,
+                "Amount exceeds the limit of 10,000.", DateTime.UtcNow));
+            await WaitForMessageAsync(changes, m => m.TransferId == transfer.Id, seconds: 10);
+
+            await PublishAsync(new TransferApproved(
+                transfer.Id, transfer.FromAccount, transfer.ToAccount, transfer.Amount, transfer.Currency, DateTime.UtcNow));
+
+            // 3 retries, 5 seconds apart, happen first.
+            await WaitForMessageAsync(faults, f => f.Message.TransferId == transfer.Id, seconds: 40);
+
+            while (changes.Reader.TryRead(out var extra))
+                Assert.NotEqual(transfer.Id, extra.TransferId);
+
+            await WaitForStatusAsync(transfer.Id, "Rejected");
+        }
+        finally
+        {
+            await faultSubscription.StopAsync();
+            await changeSubscription.StopAsync();
+        }
+    }
+
+    // A temporary queue bound to T's exchange. Must be connected BEFORE the message is published:
+    // without a bound queue, RabbitMQ drops it.
+    private async Task<HostReceiveEndpointHandle> SubscribeAsync<T>(Channel<T> received) where T : class
+    {
+        var handle = _factory.Services.GetRequiredService<IBus>().ConnectReceiveEndpoint(e =>
+            e.Handler<T>(context => received.Writer.WriteAsync(context.Message).AsTask()));
+        await handle.Ready;
+        return handle;
+    }
+
+    // Other tests in this class also publish, so skip messages about other transfers.
+    private static async Task<T> WaitForMessageAsync<T>(Channel<T> received, Func<T, bool> matches, int seconds)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(seconds));
+        T message;
+        do
+        {
+            message = await received.Reader.ReadAsync(timeout.Token);
+        } while (!matches(message));
+
+        return message;
     }
 
     private async Task<CreatedTransfer> CreateTransferAsync()

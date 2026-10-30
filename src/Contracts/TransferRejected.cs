@@ -1,6 +1,6 @@
 namespace Contracts;
 
-// Published by RiskWorker. Consumed by TransferApi (status update) and NotificationWorker.
+// Published by RiskWorker. Consumed by TransferApi (status update) 
 public record TransferRejected(
     Guid TransferId,
     string FromAccount,
