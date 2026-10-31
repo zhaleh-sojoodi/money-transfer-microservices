@@ -1015,6 +1015,72 @@ The new queue will be `notification-worker-transfer-status-changed`.
 
 Total: **30 tests** (TransferApi 8 unit + 13 integration, RiskWorker 4 unit, NotificationWorker 5 integration).
 
+## Step 22 — Dockerfiles for the three services
+
+```
+Dockerfile ──build──► Image ──run──► Container
+```
+- **Dockerfile**: the recipe. **Image**: the packaged service. **Container**: a running copy of the image.
+- Each of our services has its own Dockerfile. Postgres and RabbitMQ don't need one, because their images already exist.
+- A container runs the code from when its image was built, so **code changes need a rebuild**.
+
+**Files**: `.dockerignore` (repo root) and a `Dockerfile` in `src/TransferApi`, `src/RiskWorker` and `src/NotificationWorker`.
+
+**Build from the repo root** (the final `.` is the build context, and it must include `src/Contracts`):
+```powershell
+docker build -f src/TransferApi/Dockerfile -t transfer-api .
+```
+
+**What the Dockerfile does**
+| Part | Why |
+|---|---|
+| Two `FROM` lines (multi-stage build) | Compile with the large SDK image, then copy only the output onto a smaller image |
+| Copy `.csproj` files, restore, then copy the code | Docker reuses a step if its input didn't change, so a code edit doesn't download packages again |
+| `aspnet:8.0` vs `runtime:8.0` | The API needs a web server; workers only need the plain .NET runtime |
+| `USER $APP_UID` | Runs as a normal user, not root, which limits the damage if the service is ever hacked |
+| `ENTRYPOINT` | The command that runs when the container starts |
+
+**`.dockerignore`** keeps `.env` and `appsettings.Development.json` out of the images. The images hold no connection strings, so they must be given as environment variables, and a double underscore stands for `:`:
+```
+ConnectionStrings__TransferDb=...
+```
+
+**Inside a container, `localhost` means the container itself.** Containers on the same Docker network use service names and internal ports: `transfer-db:5432`, `notification-db:5432`, `rabbitmq:5672`. Port `5433` only exists on my machine.
+
+**Verified**: ran the three images on the compose network and sent 75.00 EUR through them. The transfer became `Approved` and the notification was saved.
+
+⚠️ Those containers ran as `Production`, so `Migrate()` was skipped; it worked only because the tables already existed. Compose must set `ASPNETCORE_ENVIRONMENT` (API) and `DOTNET_ENVIRONMENT` (workers) to `Development`.
+
+Swagger now runs in every environment (moved out of the `IsDevelopment` block). The API has no login, so restrict both before putting it on the public internet.
+
+## Step 23 — Everything in docker-compose
+
+**One command starts the whole system**
+```powershell
+docker compose up -d --build   # --build rebuilds images after code changes
+docker compose ps              # what's running, and is it healthy
+docker compose logs -f transfer-api
+docker compose down            # stops everything; data stays in the volumes
+```
+Swagger: http://localhost:8081/swagger
+
+**New in `docker-compose.yml`**
+- `build`: build the image from a Dockerfile, instead of downloading one with `image`.
+- `environment`: connection strings with service names, and values from `.env`.
+- `healthcheck`: a command Docker runs repeatedly to see if a container is really ready (`pg_isready`, `rabbitmq-diagnostics ping`).
+- `depends_on` + `condition: service_healthy`: wait until the database and RabbitMQ are **ready**, not just started. Postgres takes a few seconds to accept connections after its container starts.
+- `$$POSTGRES_USER`: the double `$` tells Compose to leave it alone, so the variable is read inside the container.
+
+**Working on one service locally**: stop its container first, otherwise two copies read the same queue and take turns with the messages.
+```powershell
+docker compose stop transfer-api
+dotnet run --project src/TransferApi
+```
+
+**Verified**: 60.00 EUR became `Approved`, 15,000.00 EUR became `Rejected` with the reason, both notifications were saved, the outbox was empty and each queue had 1 consumer.
+
+**Not tested**: migrating an empty database in a container. `Migrate()` ran, but the tables already existed ("No migrations were applied").
+
 ## To do / open items
 - [x] Delete the old `money-transfer-microservices/` template folder
 - [x] Start Docker Desktop → `docker compose up -d` → apply the migration → check the table in psql
@@ -1038,5 +1104,7 @@ Total: **30 tests** (TransferApi 8 unit + 13 integration, RiskWorker 4 unit, Not
 - [x] NotificationWorker (own database `notification_db`, queues `notification-worker-…`) — consumes `TransferApproved` / `TransferRejected` (original design), verified end-to-end
 - [x] NotificationWorker tests (Testcontainers Postgres + MassTransit harness; duplicate → 1 row; race → `TryAddAsync` false)
 - [x] `TransferStatusChanged` design change, verified end-to-end (see Step 21)
-- [ ] Next: containerise the three services (Dockerfiles, docker-compose), then Kubernetes
+- [x] Dockerfiles for the three services (see Step 22)
+- [x] Add the three services to docker-compose (see Step 23)
+- [ ] Next: Kubernetes
 - [ ] Optional, only when adding email: SendGrid via Pending/Sent + background sender

@@ -10,6 +10,11 @@ services:
       - "5432:5432"
     volumes:
       - transfer-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
   notification-db:
     image: postgres:16
     container_name: notification-db
@@ -21,6 +26,11 @@ services:
       - "5433:5432"   # 5433 on the host, because transfer-db already uses 5432
     volumes:
       - notification-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
   rabbitmq:
     image: rabbitmq:4.1-management
     container_name: rabbitmq
@@ -33,6 +43,55 @@ services:
       - "15672:15672"
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # Our services. Inside this network they use service names and internal ports, not localhost.
+  # "Development" makes each service with a database apply its migrations at startup.
+  transfer-api:
+    build:
+      context: .   # the repo root, because every service also needs src/Contracts
+      dockerfile: src/TransferApi/Dockerfile
+    container_name: transfer-api
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__TransferDb: Host=transfer-db;Port=5432;Database=${TRANSFER_DB_NAME};Username=${TRANSFER_DB_USER};Password=${TRANSFER_DB_PASSWORD}
+      ConnectionStrings__RabbitMq: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672
+    ports:
+      - "8081:8080"   # 8081 on the host, so it doesn't clash with dotnet run on 5243
+    depends_on:
+      transfer-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+  risk-worker:
+    build:
+      context: .
+      dockerfile: src/RiskWorker/Dockerfile
+    container_name: risk-worker
+    environment:
+      DOTNET_ENVIRONMENT: Development
+      ConnectionStrings__RabbitMq: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+  notification-worker:
+    build:
+      context: .
+      dockerfile: src/NotificationWorker/Dockerfile
+    container_name: notification-worker
+    environment:
+      DOTNET_ENVIRONMENT: Development
+      ConnectionStrings__NotificationDb: Host=notification-db;Port=5432;Database=${NOTIFICATION_DB_NAME};Username=${NOTIFICATION_DB_USER};Password=${NOTIFICATION_DB_PASSWORD}
+      ConnectionStrings__RabbitMq: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672
+    depends_on:
+      notification-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
 
 volumes:
   transfer-db-data:

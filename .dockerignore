@@ -1,0 +1,15 @@
+# Secrets and local settings must never end up in an image
+.env
+.env.*
+**/appsettings.Development.json
+
+# Build output: the image compiles its own
+**/bin/
+**/obj/
+
+# Not needed to build a service
+.git/
+.vs/
+docs/
+tests/
+*.md

@@ -61,10 +61,10 @@ if (app.Environment.IsDevelopment())
     {
         scope.ServiceProvider.GetRequiredService<TransferDbContext>().Database.Migrate();
     }
-
-    app.UseSwagger();
-    app.UseSwaggerUI();
 }
+
+app.UseSwagger();
+app.UseSwaggerUI();
 
 app.UseHttpsRedirection();
 
