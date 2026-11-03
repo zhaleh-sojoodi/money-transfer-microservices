@@ -1,0 +1,45 @@
+# NotificationWorker. Image built locally: docker build -f src/NotificationWorker/Dockerfile -t notification-worker .
+# No Service: nothing connects to a worker. It only reads from RabbitMQ.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-worker
+  namespace: money-transfer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notification-worker
+  template:
+    metadata:
+      labels:
+        app: notification-worker
+    spec:
+      containers:
+        - name: notification-worker
+          image: notification-worker:latest
+          imagePullPolicy: Never
+          env:
+            # Development: applies migrations at startup
+            - name: DOTNET_ENVIRONMENT
+              value: Development
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: NOTIFICATION_DB_NAME }
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: NOTIFICATION_DB_USER }
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: NOTIFICATION_DB_PASSWORD }
+            - name: RABBITMQ_USER
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: RABBITMQ_USER }
+            - name: RABBITMQ_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: RABBITMQ_PASSWORD }
+            - name: ConnectionStrings__NotificationDb
+              value: Host=notification-db;Port=5432;Database=$(DB_NAME);Username=$(DB_USER);Password=$(DB_PASSWORD)
+            - name: ConnectionStrings__RabbitMq
+              value: amqp://$(RABBITMQ_USER):$(RABBITMQ_PASSWORD)@rabbitmq:5672

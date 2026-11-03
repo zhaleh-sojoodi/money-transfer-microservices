@@ -1,0 +1,33 @@
+# RiskWorker. Image built locally: docker build -f src/RiskWorker/Dockerfile -t risk-worker .
+# No Service: nothing connects to a worker. It only reads from RabbitMQ.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: risk-worker
+  namespace: money-transfer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: risk-worker
+  template:
+    metadata:
+      labels:
+        app: risk-worker
+    spec:
+      containers:
+        - name: risk-worker
+          image: risk-worker:latest
+          imagePullPolicy: Never
+          env:
+            - name: DOTNET_ENVIRONMENT
+              value: Development
+            - name: RABBITMQ_USER
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: RABBITMQ_USER }
+            - name: RABBITMQ_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: RABBITMQ_PASSWORD }
+            - name: ConnectionStrings__RabbitMq
+              value: amqp://$(RABBITMQ_USER):$(RABBITMQ_PASSWORD)@rabbitmq:5672

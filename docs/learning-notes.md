@@ -1081,6 +1081,83 @@ dotnet run --project src/TransferApi
 
 **Not tested**: migrating an empty database in a container. `Migrate()` ran, but the tables already existed ("No migrations were applied").
 
+## Step 24 — Kubernetes: cluster, namespace, Secret, databases and RabbitMQ
+
+**Local cluster**: Docker Desktop → Settings → Kubernetes, type **Kubeadm**. The node is `docker-desktop`.
+- **kind** (the other type) runs nodes as containers with their own image store, so `docker build` images aren't visible (`ErrImageNeverPull`).
+- **Kubeadm** shares Docker's images: `docker build` → usable in the cluster straight away.
+- A cloud cluster can't see my laptop's images; there images go to a registry (Docker Hub, Azure Container Registry).
+
+**Compose → Kubernetes**
+| Kubernetes | What it is | In Compose |
+|---|---|---|
+| Pod | Smallest thing Kubernetes runs, usually one container | Container |
+| Deployment | Keeps N copies of a pod running | Service + restart |
+| StatefulSet | Like a Deployment, but each pod keeps its storage and a fixed name (`rabbitmq-0`) | |
+| Service | Fixed name and address for pods (`transfer-db`) | Service name |
+| Secret | Passwords given to pods | `.env` |
+| PersistentVolumeClaim | Storage that survives pod restarts | Volume |
+| readinessProbe | Pod gets traffic only once this command succeeds | healthcheck |
+| Namespace | A separate area of the cluster | Project name |
+
+**Files in `k8s/`**: `namespace.yaml`, `transfer-db.yaml`, `notification-db.yaml`, `rabbitmq.yaml`. Each has a Service and a StatefulSet.
+
+**Commands**
+```powershell
+kubectl apply -f k8s/namespace.yaml
+# The Secret is created from .env, so no password is ever in a committed file
+kubectl create secret generic money-transfer-secrets -n money-transfer --from-env-file=.env
+kubectl apply -f k8s/
+
+kubectl get pods,svc,pvc -n money-transfer
+kubectl logs rabbitmq-0 -n money-transfer
+kubectl exec -it transfer-db-0 -n money-transfer -- psql -U transfer -d transfer_db
+kubectl delete namespace money-transfer   # removes everything, including the stored data
+```
+- `-n money-transfer` is needed on every command, because by default `kubectl` looks in the `default` namespace.
+- After changing `.env`, the Secret doesn't update by itself: delete it and create it again.
+- Services are `ClusterIP`: only reachable inside the cluster, so they don't clash with Compose's ports.
+
+**Seen on the first start**: RabbitMQ crashed once with `.erlang.cookie: eacces` (no permission on its brand-new storage). Kubernetes restarted it automatically and the second start worked. This is self-healing: Compose without `restart` would have left it stopped.
+
+## Step 25 — Kubernetes: the three services
+
+**Files**: `k8s/transfer-api.yaml` (Deployment + NodePort Service), `k8s/risk-worker.yaml`, `k8s/notification-worker.yaml` (Deployment only: nothing connects to a worker).
+
+Swagger: http://localhost:30081/swagger (a NodePort must be 30000–32767).
+
+**Connection strings from the Secret**: `$(NAME)` is replaced with an env variable defined **above it** in the same list.
+```yaml
+- name: DB_PASSWORD
+  valueFrom:
+    secretKeyRef: { name: money-transfer-secrets, key: TRANSFER_DB_PASSWORD }
+- name: ConnectionStrings__TransferDb
+  value: Host=transfer-db;Port=5432;Database=$(DB_NAME);Username=$(DB_USER);Password=$(DB_PASSWORD)
+```
+
+**`imagePullPolicy: Never`**: the images only exist on my machine. With the `latest` tag, Kubernetes would otherwise try to download them and fail.
+
+**After changing code**
+```powershell
+docker build -f src/TransferApi/Dockerfile -t transfer-api .
+kubectl rollout restart deployment/transfer-api -n money-transfer   # same tag, so pods must be restarted to use the new image
+```
+
+**Deployment vs StatefulSet**: services get random pod names (`risk-worker-6785f47479-s42s6`) and no storage, so any copy can replace any other. Databases need a fixed name and their own storage.
+
+**No `depends_on` in Kubernetes**: a service that starts before its database crashes, and Kubernetes restarts it until it works. NotificationWorker did exactly this on the first deploy.
+
+**Problem found: the machine was overloaded** (Compose and Kubernetes running together)
+- RabbitMQ's `rabbitmq-diagnostics ping` probe kept timing out → marked "not ready" while working. Replaced with a `tcpSocket` probe on 5672, which is much cheaper.
+- `pg_isready` timed out with the default 1-second `timeoutSeconds` → set to 5.
+- Ports don't clash, but running both stacks at once doubles the load: stop one with `docker compose stop` when using the other.
+
+**Verified**
+- Fresh databases: `Migrate()` created all tables (the "empty database" case not tested in Step 23).
+- 40.00 EUR → `Approved`, 12,000.00 EUR → `Rejected` with the reason, both notifications saved, outbox empty.
+- Replacing the infrastructure pods kept the queues and data (storage claims), and the services reconnected by themselves.
+- Deleting the RiskWorker pod: the Deployment created a new one within seconds.
+
 ## To do / open items
 - [x] Delete the old `money-transfer-microservices/` template folder
 - [x] Start Docker Desktop → `docker compose up -d` → apply the migration → check the table in psql
@@ -1106,5 +1183,8 @@ dotnet run --project src/TransferApi
 - [x] `TransferStatusChanged` design change, verified end-to-end (see Step 21)
 - [x] Dockerfiles for the three services (see Step 22)
 - [x] Add the three services to docker-compose (see Step 23)
-- [ ] Next: Kubernetes
+- [x] Kubernetes: cluster, namespace, Secret, databases, RabbitMQ (see Step 24)
+- [x] Kubernetes Deployments for the three services, NodePort for Swagger (see Step 25)
+- [ ] Optional: migrations as a Kubernetes Job instead of `Migrate()` at startup
+- [ ] Optional: README, GitHub Actions
 - [ ] Optional, only when adding email: SendGrid via Pending/Sent + background sender

@@ -1,0 +1,63 @@
+# Postgres for NotificationWorker. Same as transfer-db.yaml, with its own database and storage.
+# Inside the cluster it uses port 5432: 5433 was only needed on my machine in Compose.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification-db
+  namespace: money-transfer
+spec:
+  selector:
+    app: notification-db
+  ports:
+    - port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: notification-db
+  namespace: money-transfer
+spec:
+  serviceName: notification-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notification-db
+  template:
+    metadata:
+      labels:
+        app: notification-db
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: NOTIFICATION_DB_NAME }
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: NOTIFICATION_DB_USER }
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: NOTIFICATION_DB_PASSWORD }
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 5
+            timeoutSeconds: 5   # the default of 1 second was too short when the machine was busy
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

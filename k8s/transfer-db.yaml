@@ -1,0 +1,68 @@
+# Postgres for TransferApi.
+# Passwords come from the Secret "money-transfer-secrets", created from .env (see docs/learning-notes.md).
+
+# Service: the fixed name "transfer-db" that other pods use to connect
+apiVersion: v1
+kind: Service
+metadata:
+  name: transfer-db
+  namespace: money-transfer
+spec:
+  selector:
+    app: transfer-db   # sends traffic to pods with this label
+  ports:
+    - port: 5432
+---
+# StatefulSet: like a Deployment, but each pod keeps its own storage across restarts
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: transfer-db
+  namespace: money-transfer
+spec:
+  serviceName: transfer-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app: transfer-db
+  template:
+    metadata:
+      labels:
+        app: transfer-db
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: TRANSFER_DB_NAME }
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: TRANSFER_DB_USER }
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: TRANSFER_DB_PASSWORD }
+            # A subfolder, because Postgres refuses to start in a folder that isn't empty
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          # Like the Compose healthcheck: the pod only receives traffic once Postgres accepts connections
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 5
+            timeoutSeconds: 5   # the default of 1 second was too short when the machine was busy
+  # Like a Compose volume: storage that survives pod restarts
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

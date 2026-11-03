@@ -1,0 +1,5 @@
+# A separate area of the cluster for this app. Deleting it removes everything inside it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: money-transfer
