@@ -1,0 +1,36 @@
+# Builds the solution and runs all tests on every push to main and every pull request.
+# Results: the "Actions" tab on GitHub.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    # GitHub's Linux machines have Docker installed, so Testcontainers can start Postgres and RabbitMQ
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      # SDK 10 builds the .slnx solution file (not supported by SDK 8);
+      # the .NET 8 runtime runs the tests, because the projects target net8.0
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Restore packages
+        run: dotnet restore money-transfer-microservices.slnx
+
+      - name: Build
+        run: dotnet build money-transfer-microservices.slnx --no-restore --configuration Release
+
+      - name: Test
+        run: dotnet test money-transfer-microservices.slnx --no-build --configuration Release --verbosity normal

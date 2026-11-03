@@ -1201,6 +1201,28 @@ docker build -f src/TransferApi/Dockerfile --target migrations -t transfer-api-m
 - Kubernetes: both Jobs `Complete`; services restarted on images without `Migrate()`; a transfer was approved and notified. It was still `Pending` after 10 seconds because the new TransferApi pod was just starting; the outbox delivered it shortly after.
 - All 30 tests pass.
 
+## Step 27 — GitHub Actions (CI)
+
+**CI (continuous integration)**: every push to `main` and every pull request is built and tested automatically on GitHub's machines. A broken build or failing test shows up immediately, not when someone else pulls the code.
+
+**File**: `.github/workflows/ci.yml`. GitHub runs every YAML file in `.github/workflows/`.
+| Part | Meaning |
+|---|---|
+| `on` | When it runs: push to `main`, any pull request |
+| `jobs` → `runs-on: ubuntu-latest` | A fresh Linux machine from GitHub, deleted afterwards |
+| `steps` | Run in order; if one fails, the rest are skipped and the run is red |
+| `uses:` | A ready-made step (an "action"), e.g. `actions/checkout` downloads the code |
+| `run:` | A shell command |
+
+- **Two .NET versions**: SDK 10 builds the `.slnx` file (SDK 8 can't read it); the .NET 8 runtime runs the `net8.0` tests.
+- **Testcontainers works there**: GitHub's Linux machines have Docker, so the integration tests start their own Postgres and RabbitMQ, just like locally.
+- **No secrets needed**: the tests use throwaway containers, never `.env`.
+- **Badge** in the README: green when the latest run on `main` passed.
+
+**Where to look**: the repo on GitHub → **Actions** tab → click a run → click a step to see its output.
+
+Comparable to an Azure DevOps pipeline (`azure-pipelines.yml`): same idea, different syntax.
+
 ## To do / open items
 - [x] Delete the old `money-transfer-microservices/` template folder
 - [x] Start Docker Desktop → `docker compose up -d` → apply the migration → check the table in psql
@@ -1230,5 +1252,5 @@ docker build -f src/TransferApi/Dockerfile --target migrations -t transfer-api-m
 - [x] Kubernetes Deployments for the three services, NodePort for Swagger (see Step 25)
 - [x] Migrations as a separate step: bundle, Compose service, Kubernetes Job (see Step 26)
 - [x] README
-- [ ] Optional: README, GitHub Actions
+- [x] GitHub Actions: build and test on every push (see Step 27)
 - [ ] Optional, only when adding email: SendGrid via Pending/Sent + background sender

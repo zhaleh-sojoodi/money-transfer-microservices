@@ -1,5 +1,7 @@
 # Money Transfer Microservices
 
+[![CI](https://github.com/zhaleh-sojoodi/money-transfer-microservices/actions/workflows/ci.yml/badge.svg)](https://github.com/zhaleh-sojoodi/money-transfer-microservices/actions/workflows/ci.yml)
+
 An event-driven money transfer system built with .NET 8, PostgreSQL and RabbitMQ, and runnable with Docker Compose or Kubernetes.
 
 A client creates a transfer through a REST API. A risk service approves or rejects it, the transfer's status is updated, and a notification is stored. The services never call each other directly or share a database: they only communicate through events on RabbitMQ.
