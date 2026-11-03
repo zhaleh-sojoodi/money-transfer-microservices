@@ -21,7 +21,7 @@ spec:
           image: notification-worker:latest
           imagePullPolicy: Never
           env:
-            # Development: applies migrations at startup
+            # Migrations run in the notification-db-migrations Job, not at startup
             - name: DOTNET_ENVIRONMENT
               value: Development
             - name: DB_NAME

@@ -49,8 +49,32 @@ services:
       timeout: 10s
       retries: 10
 
+  # One-off migration containers: apply missing migrations, then exit.
+  # The services wait for them to finish successfully before starting.
+  transfer-db-migrations:
+    build:
+      context: .
+      dockerfile: src/TransferApi/Dockerfile
+      target: migrations   # the migration stage, not the service
+    container_name: transfer-db-migrations
+    environment:
+      ConnectionStrings__TransferDb: Host=transfer-db;Port=5432;Database=${TRANSFER_DB_NAME};Username=${TRANSFER_DB_USER};Password=${TRANSFER_DB_PASSWORD}
+    depends_on:
+      transfer-db:
+        condition: service_healthy
+  notification-db-migrations:
+    build:
+      context: .
+      dockerfile: src/NotificationWorker/Dockerfile
+      target: migrations
+    container_name: notification-db-migrations
+    environment:
+      ConnectionStrings__NotificationDb: Host=notification-db;Port=5432;Database=${NOTIFICATION_DB_NAME};Username=${NOTIFICATION_DB_USER};Password=${NOTIFICATION_DB_PASSWORD}
+    depends_on:
+      notification-db:
+        condition: service_healthy
+
   # Our services. Inside this network they use service names and internal ports, not localhost.
-  # "Development" makes each service with a database apply its migrations at startup.
   transfer-api:
     build:
       context: .   # the repo root, because every service also needs src/Contracts
@@ -63,8 +87,8 @@ services:
     ports:
       - "8081:8080"   # 8081 on the host, so it doesn't clash with dotnet run on 5243
     depends_on:
-      transfer-db:
-        condition: service_healthy
+      transfer-db-migrations:
+        condition: service_completed_successfully
       rabbitmq:
         condition: service_healthy
   risk-worker:
@@ -88,8 +112,8 @@ services:
       ConnectionStrings__NotificationDb: Host=notification-db;Port=5432;Database=${NOTIFICATION_DB_NAME};Username=${NOTIFICATION_DB_USER};Password=${NOTIFICATION_DB_PASSWORD}
       ConnectionStrings__RabbitMq: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672
     depends_on:
-      notification-db:
-        condition: service_healthy
+      notification-db-migrations:
+        condition: service_completed_successfully
       rabbitmq:
         condition: service_healthy
 

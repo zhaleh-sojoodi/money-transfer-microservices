@@ -1,7 +1,9 @@
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.EntityFrameworkCore;
 using Testcontainers.PostgreSql;
 using Testcontainers.RabbitMq;
+using TransferApi.Data;
 
 namespace TransferApi.IntegrationTests;
 
@@ -15,13 +17,22 @@ public class TransferApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         // Point the API at the test containers instead of the connection strings in appsettings.
-        // The environment stays "Development", so Program.cs applies the migrations on startup.
         builder.UseSetting("ConnectionStrings:TransferDb", _postgres.GetConnectionString());
         builder.UseSetting("ConnectionStrings:RabbitMq", _rabbitMq.GetConnectionString());
     }
 
     // Runs once before the first test in the class. Both containers start in parallel.
-    public Task InitializeAsync() => Task.WhenAll(_postgres.StartAsync(), _rabbitMq.StartAsync());
+    // Program.cs no longer migrates, so the real migrations are applied here, before the API starts.
+    public async Task InitializeAsync()
+    {
+        await Task.WhenAll(_postgres.StartAsync(), _rabbitMq.StartAsync());
+
+        await using var db = new TransferDbContext(new DbContextOptionsBuilder<TransferDbContext>()
+            .UseNpgsql(_postgres.GetConnectionString())
+            .UseSnakeCaseNamingConvention()
+            .Options);
+        await db.Database.MigrateAsync();
+    }
 
     // Runs once after the last test in the class.
     // Stop the API first, so it doesn't try to reach containers that are already gone.

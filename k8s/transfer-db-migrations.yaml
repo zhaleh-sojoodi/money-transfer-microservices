@@ -1,0 +1,35 @@
+# Applies TransferApi's migrations to transfer-db once, then stops.
+# Image: docker build -f src/TransferApi/Dockerfile --target migrations -t transfer-api-migrations .
+#
+# A finished Job is not run again by "kubectl apply". To run it again (after adding a migration):
+#   kubectl delete job transfer-db-migrations -n money-transfer
+#   kubectl apply -f k8s/transfer-db-migrations.yaml
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: transfer-db-migrations
+  namespace: money-transfer
+spec:
+  # If it fails (for example, the database isn't ready yet), try again up to 4 times, waiting longer each time
+  backoffLimit: 4
+  template:
+    spec:
+      # Never restart the same pod: a failed attempt gets a new pod, so its logs stay available
+      restartPolicy: Never
+      containers:
+        - name: migrations
+          image: transfer-api-migrations:latest
+          imagePullPolicy: Never
+          env:
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: TRANSFER_DB_NAME }
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: TRANSFER_DB_USER }
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: TRANSFER_DB_PASSWORD }
+            - name: ConnectionStrings__TransferDb
+              value: Host=transfer-db;Port=5432;Database=$(DB_NAME);Username=$(DB_USER);Password=$(DB_PASSWORD)

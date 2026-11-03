@@ -1,0 +1,33 @@
+# Applies NotificationWorker's migrations to notification-db once, then stops.
+# Image: docker build -f src/NotificationWorker/Dockerfile --target migrations -t notification-worker-migrations .
+#
+# A finished Job is not run again by "kubectl apply". To run it again (after adding a migration):
+#   kubectl delete job notification-db-migrations -n money-transfer
+#   kubectl apply -f k8s/notification-db-migrations.yaml
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: notification-db-migrations
+  namespace: money-transfer
+spec:
+  backoffLimit: 4
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrations
+          image: notification-worker-migrations:latest
+          imagePullPolicy: Never
+          env:
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: NOTIFICATION_DB_NAME }
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: NOTIFICATION_DB_USER }
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: money-transfer-secrets, key: NOTIFICATION_DB_PASSWORD }
+            - name: ConnectionStrings__NotificationDb
+              value: Host=notification-db;Port=5432;Database=$(DB_NAME);Username=$(DB_USER);Password=$(DB_PASSWORD)

@@ -40,7 +40,7 @@ spec:
           ports:
             - containerPort: 8080
           env:
-            # Development: applies migrations at startup (see Step 21/23)
+            # Migrations run in the transfer-db-migrations Job, not at startup
             - name: ASPNETCORE_ENVIRONMENT
               value: Development
             - name: DB_NAME

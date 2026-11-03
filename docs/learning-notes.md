@@ -1158,6 +1158,49 @@ kubectl rollout restart deployment/transfer-api -n money-transfer   # same tag, 
 - Replacing the infrastructure pods kept the queues and data (storage claims), and the services reconnected by themselves.
 - Deleting the RiskWorker pod: the Deployment created a new one within seconds.
 
+## Step 26 — Migrations as a separate step (migration bundle, Compose service, Kubernetes Job)
+
+**Why**: with `Migrate()` at startup, several copies of a service migrate at the same moment, and the running app needs permission to change tables. Migrating by hand avoids that but is easy to forget, so it's automated instead.
+
+**Migration bundle**: `dotnet ef migrations bundle` packs all migrations into one program (`efbundle`). It needs no SDK or source code, applies only missing migrations, then exits. It reads the same connection string as the service (`ConnectionStrings__TransferDb`), because it runs the service's `Program.cs` up to `Build()` to create the `DbContext`.
+
+**What changed**
+| Where | Change |
+|---|---|
+| Both `Program.cs` | `Migrate()` removed |
+| Both Dockerfiles | New stages `migrations-build` and `migrations`, built with `--target migrations` |
+| `docker-compose.yml` | `transfer-db-migrations` and `notification-db-migrations`; the services wait with `condition: service_completed_successfully` |
+| `k8s/` | `transfer-db-migrations.yaml` and `notification-db-migrations.yaml` (Jobs) |
+| `TransferApiFactory` (tests) | Applies the migrations itself, like NotificationWorker's `PostgresFixture` |
+
+**Multi-stage target**: a plain `docker build` builds the **last** stage, so the service stage stays last. `--target migrations` builds the migration image from the same Dockerfile.
+```powershell
+docker build -f src/TransferApi/Dockerfile --target migrations -t transfer-api-migrations .
+```
+
+**Job**: a pod that runs **once** until it succeeds, then stops (`Completed`). Unrelated to RabbitMQ.
+| Resource | Runs | Here |
+|---|---|---|
+| Deployment | Forever, replaces failed pods | the three services |
+| StatefulSet | Forever, fixed name and storage | Postgres, RabbitMQ |
+| Job | Once, until it succeeds | the two migrations |
+- `backoffLimit: 4`: retry up to 4 times if it fails (for example, the database isn't ready yet).
+- `restartPolicy: Never`: each attempt gets a new pod, so the logs of a failed attempt stay available.
+- ⚠️ A finished Job is **not** run again by `kubectl apply`. After adding a migration:
+  ```powershell
+  kubectl delete job transfer-db-migrations -n money-transfer
+  kubectl apply -f k8s/transfer-db-migrations.yaml
+  ```
+- Kubernetes has no `depends_on`: if a service starts before its Job finishes, it fails and is restarted until the tables exist.
+
+**Running locally with `dotnet run`**: run `dotnet ef database update` after adding a migration (nothing migrates automatically any more).
+
+**Verified**
+- Empty database (throwaway Postgres container): both bundles created every table, including the outbox tables.
+- Compose: migration containers exited with `0`, then the services started; a transfer was approved and notified.
+- Kubernetes: both Jobs `Complete`; services restarted on images without `Migrate()`; a transfer was approved and notified. It was still `Pending` after 10 seconds because the new TransferApi pod was just starting; the outbox delivered it shortly after.
+- All 30 tests pass.
+
 ## To do / open items
 - [x] Delete the old `money-transfer-microservices/` template folder
 - [x] Start Docker Desktop → `docker compose up -d` → apply the migration → check the table in psql
@@ -1185,6 +1228,7 @@ kubectl rollout restart deployment/transfer-api -n money-transfer   # same tag, 
 - [x] Add the three services to docker-compose (see Step 23)
 - [x] Kubernetes: cluster, namespace, Secret, databases, RabbitMQ (see Step 24)
 - [x] Kubernetes Deployments for the three services, NodePort for Swagger (see Step 25)
-- [ ] Optional: migrations as a Kubernetes Job instead of `Migrate()` at startup
+- [x] Migrations as a separate step: bundle, Compose service, Kubernetes Job (see Step 26)
+- [x] README
 - [ ] Optional: README, GitHub Actions
 - [ ] Optional, only when adding email: SendGrid via Pending/Sent + background sender

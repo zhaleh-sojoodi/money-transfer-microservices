@@ -54,14 +54,8 @@ builder.Services.AddSwaggerGen();
 var app = builder.Build();
 
 // Configure the HTTP request pipeline.
-if (app.Environment.IsDevelopment())
-{
-    // Apply pending migrations on startup. Development only; production should migrate as a separate step.
-    using (var scope = app.Services.CreateScope())
-    {
-        scope.ServiceProvider.GetRequiredService<TransferDbContext>().Database.Migrate();
-    }
-}
+// Migrations are not applied here: they run as a separate step before the service starts
+// (migration bundle in docker-compose and a Kubernetes Job; dotnet ef database update locally).
 
 app.UseSwagger();
 app.UseSwaggerUI();

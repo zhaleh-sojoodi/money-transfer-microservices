@@ -42,11 +42,7 @@ builder.Services.AddMassTransit(x =>
 
 var host = builder.Build();
 
-if (host.Services.GetRequiredService<IHostEnvironment>().IsDevelopment())
-{
-    // Apply pending migrations on startup. Development only; production should migrate as a separate step.
-    using var scope = host.Services.CreateScope();
-    scope.ServiceProvider.GetRequiredService<NotificationDbContext>().Database.Migrate();
-}
+// Migrations are not applied here: they run as a separate step before the service starts
+// (migration bundle in docker-compose and a Kubernetes Job; dotnet ef database update locally).
 
 host.Run();

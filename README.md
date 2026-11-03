@@ -30,6 +30,7 @@ flowchart LR
 - **Idempotent consumers.** RabbitMQ delivers messages *at least once*, so the same event can arrive twice. A unique index on the transfer id, plus handling of the resulting duplicate-key error, guarantees one notification per transfer, even when two copies are processed at the same time.
 - **Retries and error queues.** Temporary failures, such as a database being briefly unavailable, are retried. Invalid data fails straight away and goes to an `_error` queue instead of being retried for nothing.
 - **Database per service.** Each service owns its data and schema (EF Core code-first migrations). Data moves between services only through events.
+- **Migrations as a separate step.** Services don't change the database structure at startup. A migration bundle runs once before them, so several copies of a service never migrate at the same time.
 - **Money and time.** Amounts are `decimal` / `numeric(18,2)`, never floating point. All dates are UTC.
 
 ## Tech stack
@@ -48,7 +49,7 @@ Both options need [Docker Desktop](https://www.docker.com/products/docker-deskto
 cp .env.example .env   # then fill in the values
 ```
 
-`.env` is git-ignored. Each service creates its database tables on startup.
+`.env` is git-ignored. Database migrations run as a separate step before the services start: a one-off container in Compose, a Job in Kubernetes. Both use an EF Core migration bundle.
 
 ### Option 1: Docker Compose
 
@@ -71,6 +72,8 @@ Turn on Kubernetes in Docker Desktop (Settings → Kubernetes, cluster type **Ku
 docker build -f src/TransferApi/Dockerfile -t transfer-api .
 docker build -f src/RiskWorker/Dockerfile -t risk-worker .
 docker build -f src/NotificationWorker/Dockerfile -t notification-worker .
+docker build -f src/TransferApi/Dockerfile --target migrations -t transfer-api-migrations .
+docker build -f src/NotificationWorker/Dockerfile --target migrations -t notification-worker-migrations .
 
 kubectl apply -f k8s/namespace.yaml
 kubectl create secret generic money-transfer-secrets -n money-transfer --from-env-file=.env
@@ -81,7 +84,7 @@ kubectl get pods -n money-transfer
 
 Swagger: http://localhost:30081/swagger
 
-PostgreSQL and RabbitMQ run as StatefulSets with persistent storage. The three services run as Deployments, with passwords read from a Kubernetes Secret. Remove everything, including the data, with `kubectl delete namespace money-transfer`.
+PostgreSQL and RabbitMQ run as StatefulSets with persistent storage. The three services run as Deployments, with passwords read from a Kubernetes Secret. Two Jobs apply the database migrations. Until they finish, the services may restart a few times, which is expected. Remove everything, including the data, with `kubectl delete namespace money-transfer`.
 
 Run one option at a time: both start the full system, and running them together doubles the load on the machine.
 
@@ -136,6 +139,5 @@ This is a portfolio project. Before real use, it would need:
 
 - authentication on the API
 - Swagger restricted (it's currently enabled in every environment)
-- migrations run as a separate step, such as a Kubernetes Job, instead of at service startup
 - real email delivery for notifications (they're currently only stored)
 - images pushed to a container registry, instead of built locally
